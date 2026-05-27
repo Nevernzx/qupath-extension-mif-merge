@@ -49,7 +49,7 @@ public class MifMergeExtension implements QuPathExtension, GitHubProject {
 
     @Override
     public Version getQuPathVersion() {
-        return Version.parse("0.8.0-SNAPSHOT");
+        return Version.parse("0.7.0");
     }
 
     @Override

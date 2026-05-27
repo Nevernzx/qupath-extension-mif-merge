@@ -18,7 +18,7 @@ dependencies {
     // is loaded by a QuPath install, which provides these jars).
     implementation(libs.bundles.qupath)
     implementation(libs.qupath.fxtras)
-    compileOnly("io.github.qupath:qupath-extension-bioformats:0.8.0-SNAPSHOT")
+    compileOnly("io.github.qupath:qupath-extension-bioformats:0.7.0")
 
     // bytedeco OpenCV is pulled in transitively by qupath-core-processing
     // (via libs.bundles.opencv). Declaring it explicitly makes the dependency
