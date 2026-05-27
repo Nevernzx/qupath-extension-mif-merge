@@ -251,18 +251,40 @@ public final class MifMergeCommand implements Runnable {
         return new Task<>() {
             @Override
             protected Void call() throws Exception {
+                // We run the pipeline in TWO sequential phases to keep peak memory low:
+                //  Phase A: open only the lightweight BioFormatsMifSource readers, run
+                //           SIFT registration on each pair, store the affine matrices,
+                //           then CLOSE these readers.
+                //  Phase B: open QuPath's heavier BioFormatsImageServer instances (each
+                //           with an internal reader pool + tile cache), build the
+                //           virtual merged server, write OME-TIFF, close.
+                //
+                // Previously both phases ran simultaneously (each file was opened twice
+                // before SIFT even started), which on a multi-channel qptiff WSI can
+                // cause Bio-Formats + QuPath tile caches to commit huge amounts of
+                // memory in the first few seconds and crash low-memory systems.
+
+                List<AffineTransform> movingAffines = new ArrayList<>();
+                List<List<String>> channelNamesPerSource = new ArrayList<>();
+                List<String> labels = new ArrayList<>();
+
+                // -------- Phase A: registration --------
+                appendLog(log, "Phase A: register (lightweight readers only)");
+                logMem(log, "before opening Bio-Formats readers");
                 List<MifImageSource> bf = new ArrayList<>();
-                List<ImageServer<BufferedImage>> qp = new ArrayList<>();
                 try {
                     for (File f : files) {
-                        appendLog(log, "Opening " + f.getName());
+                        appendLog(log, "  Opening " + f.getName());
                         bf.add(new BioFormatsMifSource(f));
-                        qp.add(ImageServerProvider.buildServer(f.getAbsolutePath(),
-                                BufferedImage.class));
                     }
+                    logMem(log, "after opening all Bio-Formats readers");
                     if (isCancelled()) return null;
 
-                    List<MergedServerFactory.MovingEntry> moving = new ArrayList<>();
+                    for (int i = 0; i < bf.size(); i++) {
+                        channelNamesPerSource.add(bf.get(i).getChannelNames());
+                        labels.add(stem(files.get(i).getName()));
+                    }
+
                     RegistrationOrchestrator.Config cfg = new RegistrationOrchestrator.Config();
                     cfg.dapiNameMatch = dapiName;
                     cfg.stage1TargetLongPx = stage1Long;
@@ -272,43 +294,74 @@ public final class MifMergeCommand implements Runnable {
 
                     for (int i = 1; i < bf.size(); i++) {
                         if (isCancelled()) return null;
-                        appendLog(log, String.format("Registering %s -> %s",
+                        appendLog(log, String.format("  Registering %s -> %s",
                                 files.get(i).getName(), files.get(0).getName()));
                         RegistrationOrchestrator.Result r = RegistrationOrchestrator.run(
                                 bf.get(0), bf.get(i), cfg);
-                        appendLog(log, String.format("  stage 2 inliers %d/%d, reproj median %.2fpx @L2",
+                        appendLog(log, String.format("    stage 2 inliers %d/%d, reproj median %.2fpx @L2",
                                 r.stages.stage2.nInliers, r.stages.stage2.nMatchesPostPrefilter,
                                 r.stages.stage2.medianReprojErrPx));
                         AffineTransform aff = new AffineTransform(
                                 r.matrixFullRes[0][0], r.matrixFullRes[1][0],
                                 r.matrixFullRes[0][1], r.matrixFullRes[1][1],
                                 r.matrixFullRes[0][2], r.matrixFullRes[1][2]);
-                        moving.add(new MergedServerFactory.MovingEntry(qp.get(i), aff));
+                        movingAffines.add(aff);
+                        logMem(log, "after registering pair " + i);
+                    }
+                } finally {
+                    for (MifImageSource s : bf) {
+                        try { s.close(); } catch (Exception ignored) {}
+                    }
+                    bf.clear();
+                }
+                // Hint to the GC that we just released a lot of native resources
+                System.gc();
+                logMem(log, "after closing Bio-Formats readers (Phase A done)");
+                if (isCancelled()) return null;
+
+                // -------- Phase B: merge + write --------
+                appendLog(log, "Phase B: merge + write OME-TIFF");
+                List<ImageServer<BufferedImage>> qp = new ArrayList<>();
+                try {
+                    for (File f : files) {
+                        appendLog(log, "  Opening QuPath ImageServer for " + f.getName());
+                        qp.add(ImageServerProvider.buildServer(f.getAbsolutePath(),
+                                BufferedImage.class));
+                    }
+                    logMem(log, "after opening QuPath ImageServers");
+
+                    List<MergedServerFactory.MovingEntry> moving = new ArrayList<>();
+                    for (int i = 0; i < movingAffines.size(); i++) {
+                        moving.add(new MergedServerFactory.MovingEntry(qp.get(i + 1),
+                                movingAffines.get(i)));
                     }
 
-                    List<List<String>> chans = new ArrayList<>();
-                    List<String> labels = new ArrayList<>();
-                    for (int i = 0; i < bf.size(); i++) {
-                        chans.add(bf.get(i).getChannelNames());
-                        labels.add(stem(files.get(i).getName()));
-                    }
                     List<MergedChannelLayout.ChannelEntry> layout =
-                            MergedChannelLayout.build(chans, labels, dapiName);
-                    appendLog(log, "Merged layout has " + layout.size() + " channels");
+                            MergedChannelLayout.build(channelNamesPerSource, labels, dapiName);
+                    appendLog(log, "  Merged layout has " + layout.size() + " channels");
 
                     ImageServer<BufferedImage> merged = MergedServerFactory.build(
                             qp.get(0), moving, layout);
 
-                    appendLog(log, "Writing OME-TIFF: " + outPath);
+                    appendLog(log, "  Writing OME-TIFF: " + outPath);
                     OmeTiffMergeWriter.write(merged, outPath, new OmeTiffMergeWriter.Options());
                     appendLog(log, "Done.");
                     return null;
                 } finally {
-                    for (MifImageSource s : bf) s.close();
-                    for (ImageServer<BufferedImage> s : qp) try { s.close(); } catch (Exception ignored) {}
+                    for (ImageServer<BufferedImage> s : qp) {
+                        try { s.close(); } catch (Exception ignored) {}
+                    }
                 }
             }
         };
+    }
+
+    /** Log current heap usage to the task log so the user can spot allocation spikes. */
+    private static void logMem(TextArea log, String label) {
+        Runtime rt = Runtime.getRuntime();
+        long used = (rt.totalMemory() - rt.freeMemory()) / (1024L * 1024L);
+        long heapMax = rt.maxMemory() / (1024L * 1024L);
+        appendLog(log, String.format("  [mem] %s: heap used %d MB / max %d MB", label, used, heapMax));
     }
 
     private static void appendLog(TextArea log, String line) {
