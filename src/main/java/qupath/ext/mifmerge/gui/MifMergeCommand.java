@@ -227,9 +227,19 @@ public final class MifMergeCommand implements Runnable {
                 log,
                 bottomRow);
         content.setPadding(new Insets(10));
+        // Only the log should grow/shrink when the dialog is resized — keep
+        // everything else (especially the progress bar) at its natural size
+        // so the progress bar can't be pushed off-screen.
+        VBox.setVgrow(log, Priority.ALWAYS);
+        progress.setMinHeight(18);   // a bit taller than default for visibility
 
-        Scene scene = new Scene(content, 640, 600);
+        // Need enough height to show: file list (160) + file buttons + 10-row param grid
+        // (~280) + progress + log (200) + buttons. Was 600 and the progress bar fell off
+        // the bottom of the window on some setups.
+        Scene scene = new Scene(content, 700, 880);
         stage.setScene(scene);
+        stage.setMinWidth(640);
+        stage.setMinHeight(720);
 
         SimpleObjectProperty<Task<Void>> currentTask = new SimpleObjectProperty<>();
 
