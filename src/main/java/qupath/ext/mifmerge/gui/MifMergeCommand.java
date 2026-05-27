@@ -297,7 +297,7 @@ public final class MifMergeCommand implements Runnable {
                         appendLog(log, String.format("  Registering %s -> %s",
                                 files.get(i).getName(), files.get(0).getName()));
                         RegistrationOrchestrator.Result r = RegistrationOrchestrator.run(
-                                bf.get(0), bf.get(i), cfg);
+                                bf.get(0), bf.get(i), cfg, msg -> appendLog(log, msg));
                         appendLog(log, String.format("    stage 2 inliers %d/%d, reproj median %.2fpx @L2",
                                 r.stages.stage2.nInliers, r.stages.stage2.nMatchesPostPrefilter,
                                 r.stages.stage2.medianReprojErrPx));
