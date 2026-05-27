@@ -12,6 +12,7 @@ import javafx.scene.control.Alert;
 import javafx.scene.control.Button;
 import javafx.scene.control.ButtonType;
 import javafx.scene.control.CheckBox;
+import javafx.scene.control.ChoiceBox;
 import javafx.scene.control.Label;
 import javafx.scene.control.ListView;
 import javafx.scene.control.ProgressBar;
@@ -42,6 +43,7 @@ import qupath.ext.mifmerge.core.RegistrationOrchestrator;
 import qupath.ext.mifmerge.io.BioFormatsMifSource;
 import qupath.ext.mifmerge.merge.MergedServerFactory;
 import qupath.ext.mifmerge.merge.OmeTiffMergeWriter;
+import qupath.lib.images.writers.ome.OMEPyramidWriter;
 import qupath.lib.gui.QuPathGUI;
 import qupath.lib.images.servers.ImageServer;
 import qupath.lib.images.servers.ImageServerProvider;
@@ -172,6 +174,16 @@ public final class MifMergeCommand implements Runnable {
         Spinner<Integer> stage3NumWindows = new Spinner<>(4, 64, 16, 2);
         Spinner<Integer> stage3WindowSize = new Spinner<>(512, 8192, 2048, 256);
 
+        // OME-TIFF writer options
+        ChoiceBox<String> compressionChoice = new ChoiceBox<>();
+        compressionChoice.getItems().addAll(
+                "Uncompressed (fastest, ~2x file size)",
+                "LZW (lossless, default)",
+                "ZLIB (lossless, alternative)",
+                "J2K_LOSSY (smallest file, minor quality loss)");
+        compressionChoice.setValue("LZW (lossless, default)");
+        Spinner<Integer> tileSizeSpinner = new Spinner<>(256, 4096, 1024, 256);
+
         GridPane grid = new GridPane();
         grid.setHgap(8);
         grid.setVgap(6);
@@ -184,6 +196,8 @@ public final class MifMergeCommand implements Runnable {
         grid.add(stage3Enable, 0, 5, 2, 1);
         grid.addRow(6, new Label("  Stage 3 windows:"), stage3NumWindows);
         grid.addRow(7, new Label("  Stage 3 window size (px):"), stage3WindowSize);
+        grid.addRow(8, new Label("OME-TIFF compression:"), compressionChoice);
+        grid.addRow(9, new Label("OME-TIFF tile size (px):"), tileSizeSpinner);
         GridPane.setHgrow(outRow, Priority.ALWAYS);
 
         // --- Progress + log ---
@@ -241,6 +255,8 @@ public final class MifMergeCommand implements Runnable {
                     stage3Enable.isSelected(),
                     stage3NumWindows.getValue(),
                     stage3WindowSize.getValue(),
+                    compressionFromChoice(compressionChoice.getValue()),
+                    tileSizeSpinner.getValue(),
                     log);
             // Bind the progress bar + status label to the Task's progress/message.
             // Task#updateProgress and #updateMessage (called from the worker thread)
@@ -303,6 +319,7 @@ public final class MifMergeCommand implements Runnable {
                                 String dapiName, int stage1Long, int stage2Long,
                                 int nFeatures,
                                 boolean enableStage3, int stage3NumWindows, int stage3WindowSize,
+                                OMEPyramidWriter.CompressionType compression, int tileSize,
                                 TextArea log) {
         return new Task<>() {
             @Override
@@ -446,7 +463,12 @@ public final class MifMergeCommand implements Runnable {
                     updateProgress(0.70, 1);
                     updateMessage("Writing OME-TIFF (this is usually the slowest step)…");
                     appendLog(log, "  Writing OME-TIFF: " + outPath);
-                    OmeTiffMergeWriter.write(merged, outPath, new OmeTiffMergeWriter.Options());
+                    appendLog(log, String.format("  Compression=%s, tileSize=%d",
+                            compression, tileSize));
+                    OmeTiffMergeWriter.Options writeOpts = new OmeTiffMergeWriter.Options();
+                    writeOpts.compression = compression;
+                    writeOpts.tileSize = tileSize;
+                    OmeTiffMergeWriter.write(merged, outPath, writeOpts);
                     appendLog(log, "Done.");
                     updateProgress(1.0, 1);
                     updateMessage("Done.");
@@ -458,6 +480,16 @@ public final class MifMergeCommand implements Runnable {
                 }
             }
         };
+    }
+
+    /** Map the GUI dropdown label to an OMEPyramidWriter.CompressionType. */
+    private static OMEPyramidWriter.CompressionType compressionFromChoice(String s) {
+        if (s == null) return OMEPyramidWriter.CompressionType.LZW;
+        if (s.startsWith("Uncompressed")) return OMEPyramidWriter.CompressionType.UNCOMPRESSED;
+        if (s.startsWith("LZW")) return OMEPyramidWriter.CompressionType.LZW;
+        if (s.startsWith("ZLIB")) return OMEPyramidWriter.CompressionType.ZLIB;
+        if (s.startsWith("J2K_LOSSY") || s.startsWith("J2K")) return OMEPyramidWriter.CompressionType.J2K_LOSSY;
+        return OMEPyramidWriter.CompressionType.LZW;
     }
 
     /** Log current heap usage to the task log so the user can spot allocation spikes. */

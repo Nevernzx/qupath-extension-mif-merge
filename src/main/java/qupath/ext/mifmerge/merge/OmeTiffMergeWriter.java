@@ -21,7 +21,14 @@ public final class OmeTiffMergeWriter {
     private static final Logger logger = LoggerFactory.getLogger(OmeTiffMergeWriter.class);
 
     public static final class Options {
-        public int tileSize = 512;
+        /**
+         * Output tile size. 512 was the previous default; in practice that caused
+         * the write to be dominated by per-tile coordination overhead (a 50000 px
+         * WSI has 10000+ tiles × N channels × ~5 pyramid levels = millions of
+         * tile coordinate calls into Bio-Formats + TransformedServerBuilder).
+         * 1024 is a much better default — 4x fewer tiles, similar per-pixel work.
+         */
+        public int tileSize = 1024;
         /** If null, use dyadic (1x, 2x, 4x, ...) downsamples; otherwise explicit list. */
         public double[] downsamples = null;
         public OMEPyramidWriter.CompressionType compression = OMEPyramidWriter.CompressionType.LZW;
