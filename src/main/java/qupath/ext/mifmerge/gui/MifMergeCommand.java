@@ -6,10 +6,10 @@ import javafx.collections.FXCollections;
 import javafx.collections.ObservableList;
 import javafx.concurrent.Task;
 import javafx.geometry.Insets;
+import javafx.scene.Scene;
 import javafx.scene.control.Alert;
 import javafx.scene.control.Button;
 import javafx.scene.control.ButtonType;
-import javafx.scene.control.Dialog;
 import javafx.scene.control.Label;
 import javafx.scene.control.ListView;
 import javafx.scene.control.ProgressBar;
@@ -21,6 +21,8 @@ import javafx.scene.layout.HBox;
 import javafx.scene.layout.Priority;
 import javafx.scene.layout.VBox;
 import javafx.stage.FileChooser;
+import javafx.stage.Modality;
+import javafx.stage.Stage;
 import javafx.stage.Window;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -64,16 +66,29 @@ public final class MifMergeCommand implements Runnable {
 
     @Override
     public void run() {
-        Window owner = qupath != null && qupath.getStage() != null ? qupath.getStage() : null;
-        showDialog(owner);
+        // Wrap everything in try/catch so any unexpected error surfaces in the
+        // QuPath log instead of silently freezing the FX thread.
+        try {
+            Window owner = qupath != null && qupath.getStage() != null ? qupath.getStage() : null;
+            showDialog(owner);
+        } catch (Throwable t) {
+            logger.error("MIF Merge: failed to open dialog", t);
+            try {
+                showError(null, "MIF Merge failed to open: " + t);
+            } catch (Throwable ignored) {}
+        }
     }
 
     private void showDialog(Window owner) {
-        Dialog<ButtonType> dialog = new Dialog<>();
-        dialog.setTitle("MIF Merge — register and combine multi-channel qptiffs");
+        // Use a plain Stage (non-modal, non-blocking) instead of Dialog.showAndWait()
+        // — showAndWait blocks the FX thread, and a modal Dialog whose window ends up
+        // hidden behind the main QuPath window or off-screen will look like a freeze.
+        Stage stage = new Stage();
+        stage.setTitle("MIF Merge — register and combine multi-channel qptiffs");
         if (owner != null) {
-            dialog.initOwner(owner);
+            stage.initOwner(owner);
         }
+        stage.initModality(Modality.NONE);   // explicit: main window stays interactive
 
         // --- File list ---
         ObservableList<File> files = FXCollections.observableArrayList();
@@ -102,7 +117,7 @@ public final class MifMergeCommand implements Runnable {
             fc.setTitle("Choose qptiff files (Ctrl/Cmd-click to select multiple)");
             fc.getExtensionFilters().add(new FileChooser.ExtensionFilter(
                     "qptiff / tif / ome.tif", "*.qptiff", "*.tif", "*.tiff", "*.ome.tif"));
-            List<File> chosen = fc.showOpenMultipleDialog(owner);
+            List<File> chosen = fc.showOpenMultipleDialog(stage);
             if (chosen != null) files.addAll(chosen);
         });
         removeBtn.setOnAction(e -> {
@@ -127,7 +142,7 @@ public final class MifMergeCommand implements Runnable {
                 if (parent != null) fc.setInitialDirectory(parent);
                 fc.setInitialFileName(stem(files.get(0).getName()) + "-merged.ome.tif");
             }
-            File chosen = fc.showSaveDialog(owner);
+            File chosen = fc.showSaveDialog(stage);
             if (chosen != null) outPathField.setText(chosen.getAbsolutePath());
         });
         HBox outRow = new HBox(8, outPathField, browseOut);
@@ -154,6 +169,11 @@ public final class MifMergeCommand implements Runnable {
         ProgressBar progress = new ProgressBar(0);
         progress.setPrefWidth(Double.MAX_VALUE);
 
+        // --- Bottom row: Run + Close ---
+        Button runBtn = new Button("Run merge");
+        Button closeBtn = new Button("Close");
+        HBox bottomRow = new HBox(8, runBtn, closeBtn);
+
         VBox content = new VBox(8,
                 new Label("Select qptiffs (first is the fixed reference):"),
                 fileList,
@@ -161,30 +181,25 @@ public final class MifMergeCommand implements Runnable {
                 grid,
                 new Label("Progress:"),
                 progress,
-                log);
+                log,
+                bottomRow);
         content.setPadding(new Insets(10));
-        dialog.getDialogPane().setContent(content);
 
-        ButtonType runType = new ButtonType("Run merge", ButtonType.OK.getButtonData());
-        dialog.getDialogPane().getButtonTypes().addAll(runType, ButtonType.CLOSE);
-        Button runBtn = (Button) dialog.getDialogPane().lookupButton(runType);
+        Scene scene = new Scene(content, 640, 600);
+        stage.setScene(scene);
 
         SimpleObjectProperty<Task<Void>> currentTask = new SimpleObjectProperty<>();
 
-        runBtn.addEventFilter(javafx.event.ActionEvent.ACTION, evt -> {
+        runBtn.setOnAction(evt -> {
             if (files.size() < 2) {
-                evt.consume();
-                showError(owner, "Pick at least 2 qptiff files (first = fixed reference).");
+                showError(stage, "Pick at least 2 qptiff files (first = fixed reference).");
                 return;
             }
             String outPath = outPathField.getText();
             if (outPath == null || outPath.isBlank()) {
-                evt.consume();
-                showError(owner, "Set an output path.");
+                showError(stage, "Set an output path.");
                 return;
             }
-            // Consume so the dialog stays open while the task runs.
-            evt.consume();
             runBtn.setDisable(true);
             progress.setProgress(ProgressBar.INDETERMINATE_PROGRESS);
             log.clear();
@@ -197,14 +212,14 @@ public final class MifMergeCommand implements Runnable {
             task.setOnSucceeded(e -> Platform.runLater(() -> {
                 progress.setProgress(1.0);
                 runBtn.setDisable(false);
-                showInfo(owner, "Merge complete:\n" + outPath);
+                showInfo(stage, "Merge complete:\n" + outPath);
             }));
             task.setOnFailed(e -> Platform.runLater(() -> {
                 progress.setProgress(0);
                 runBtn.setDisable(false);
                 Throwable t = task.getException();
                 logger.error("MIF Merge failed", t);
-                showError(owner, "Failed: " + (t == null ? "(no exception)" : t.getMessage()));
+                showError(stage, "Failed: " + (t == null ? "(no exception)" : t.getMessage()));
             }));
             currentTask.set(task);
             Thread thr = new Thread(task, "mif-merge-task");
@@ -212,14 +227,16 @@ public final class MifMergeCommand implements Runnable {
             thr.start();
         });
 
-        dialog.setOnCloseRequest(evt -> {
+        closeBtn.setOnAction(evt -> stage.close());
+
+        stage.setOnCloseRequest(evt -> {
             Task<Void> t = currentTask.get();
             if (t != null && t.isRunning()) {
                 t.cancel(true);
             }
         });
 
-        dialog.showAndWait();
+        stage.show();   // non-blocking
     }
 
     private Task<Void> makeTask(List<File> files, String outPath,
