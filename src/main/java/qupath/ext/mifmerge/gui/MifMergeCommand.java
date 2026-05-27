@@ -151,6 +151,10 @@ public final class MifMergeCommand implements Runnable {
         TextField dapiField = new TextField("DAPI");
         Spinner<Integer> stage1Long = new Spinner<>(1000, 20000, 4000, 500);
         Spinner<Integer> stage2Long = new Spinner<>(1000, 50000, 14000, 1000);
+        // Cap on SIFT keypoints per image. Memory scales ~linearly with this.
+        // Default 60000 needs ~1.5 GB heap on 14000-px images. Drop to 15000
+        // for 6-GB Windows machines.
+        Spinner<Integer> nFeaturesSpinner = new Spinner<>(2000, 100000, 60000, 5000);
 
         GridPane grid = new GridPane();
         grid.setHgap(8);
@@ -160,6 +164,7 @@ public final class MifMergeCommand implements Runnable {
         grid.addRow(1, new Label("DAPI channel match:"), dapiField);
         grid.addRow(2, new Label("Stage 1 long side (px):"), stage1Long);
         grid.addRow(3, new Label("Stage 2 long side (px):"), stage2Long);
+        grid.addRow(4, new Label("SIFT keypoints per image:"), nFeaturesSpinner);
         GridPane.setHgrow(outRow, Priority.ALWAYS);
 
         // --- Progress + log ---
@@ -208,6 +213,7 @@ public final class MifMergeCommand implements Runnable {
                     new ArrayList<>(files), outPath,
                     dapiField.getText(),
                     stage1Long.getValue(), stage2Long.getValue(),
+                    nFeaturesSpinner.getValue(),
                     log);
             task.setOnSucceeded(e -> Platform.runLater(() -> {
                 progress.setProgress(1.0);
@@ -241,7 +247,7 @@ public final class MifMergeCommand implements Runnable {
 
     private Task<Void> makeTask(List<File> files, String outPath,
                                 String dapiName, int stage1Long, int stage2Long,
-                                TextArea log) {
+                                int nFeatures, TextArea log) {
         return new Task<>() {
             @Override
             protected Void call() throws Exception {
@@ -261,6 +267,8 @@ public final class MifMergeCommand implements Runnable {
                     cfg.dapiNameMatch = dapiName;
                     cfg.stage1TargetLongPx = stage1Long;
                     cfg.stage2TargetLongPx = stage2Long;
+                    cfg.stage1Params.nFeatures(nFeatures);
+                    cfg.stage2Params.nFeatures(nFeatures);
 
                     for (int i = 1; i < bf.size(); i++) {
                         if (isCancelled()) return null;
