@@ -189,6 +189,15 @@ public final class MifMergeCommand implements Runnable {
         // ~30% faster write on a machine with plenty of RAM.
         Spinner<Integer> writeThreadsSpinner = new Spinner<>(1, 16, 2, 1);
 
+        // Pyramid mode — dyadic is the safe default but lowest levels are rarely
+        // accessed; sparse or single can cut write time by 20-40%.
+        ChoiceBox<String> pyramidChoice = new ChoiceBox<>();
+        pyramidChoice.getItems().addAll(
+                "Dyadic (1, 2, 4, 8, ...) — smooth QuPath zoom",
+                "Sparse (1, 4, 16) — faster write, OK zoom",
+                "Single level — fastest, no QuPath zoom support");
+        pyramidChoice.setValue("Dyadic (1, 2, 4, 8, ...) — smooth QuPath zoom");
+
         GridPane grid = new GridPane();
         grid.setHgap(8);
         grid.setVgap(6);
@@ -204,6 +213,7 @@ public final class MifMergeCommand implements Runnable {
         grid.addRow(8, new Label("OME-TIFF compression:"), compressionChoice);
         grid.addRow(9, new Label("OME-TIFF tile size (px):"), tileSizeSpinner);
         grid.addRow(10, new Label("OME-TIFF write threads:"), writeThreadsSpinner);
+        grid.addRow(11, new Label("OME-TIFF pyramid:"), pyramidChoice);
         GridPane.setHgrow(outRow, Priority.ALWAYS);
 
         // --- Progress + log ---
@@ -242,10 +252,10 @@ public final class MifMergeCommand implements Runnable {
         // Need enough height to show: file list (160) + file buttons + 10-row param grid
         // (~280) + progress + log (200) + buttons. Was 600 and the progress bar fell off
         // the bottom of the window on some setups.
-        Scene scene = new Scene(content, 700, 880);
+        Scene scene = new Scene(content, 720, 920);
         stage.setScene(scene);
-        stage.setMinWidth(640);
-        stage.setMinHeight(720);
+        stage.setMinWidth(660);
+        stage.setMinHeight(760);
 
         SimpleObjectProperty<Task<Void>> currentTask = new SimpleObjectProperty<>();
 
@@ -274,6 +284,7 @@ public final class MifMergeCommand implements Runnable {
                     compressionFromChoice(compressionChoice.getValue()),
                     tileSizeSpinner.getValue(),
                     writeThreadsSpinner.getValue(),
+                    pyramidModeFromChoice(pyramidChoice.getValue()),
                     log);
             // Bind the progress bar + status label to the Task's progress/message.
             // Task#updateProgress and #updateMessage (called from the worker thread)
@@ -338,6 +349,7 @@ public final class MifMergeCommand implements Runnable {
                                 boolean enableStage3, int stage3NumWindows, int stage3WindowSize,
                                 OMEPyramidWriter.CompressionType compression, int tileSize,
                                 int nWriteThreads,
+                                OmeTiffMergeWriter.PyramidMode pyramidMode,
                                 TextArea log) {
         return new Task<>() {
             @Override
@@ -481,12 +493,13 @@ public final class MifMergeCommand implements Runnable {
                     updateProgress(0.70, 1);
                     updateMessage("Writing OME-TIFF (this is usually the slowest step)…");
                     appendLog(log, "  Writing OME-TIFF: " + outPath);
-                    appendLog(log, String.format("  Compression=%s, tileSize=%d, writeThreads=%d",
-                            compression, tileSize, nWriteThreads));
+                    appendLog(log, String.format("  Compression=%s, tileSize=%d, writeThreads=%d, pyramid=%s",
+                            compression, tileSize, nWriteThreads, pyramidMode));
                     OmeTiffMergeWriter.Options writeOpts = new OmeTiffMergeWriter.Options();
                     writeOpts.compression = compression;
                     writeOpts.tileSize = tileSize;
                     writeOpts.nWriteThreads = nWriteThreads;
+                    writeOpts.pyramidMode = pyramidMode;
                     OmeTiffMergeWriter.write(merged, outPath, writeOpts);
                     appendLog(log, "Done.");
 
@@ -507,6 +520,14 @@ public final class MifMergeCommand implements Runnable {
                 }
             }
         };
+    }
+
+    /** Map the GUI dropdown label to an OmeTiffMergeWriter.PyramidMode. */
+    private static OmeTiffMergeWriter.PyramidMode pyramidModeFromChoice(String s) {
+        if (s == null) return OmeTiffMergeWriter.PyramidMode.DYADIC;
+        if (s.startsWith("Sparse")) return OmeTiffMergeWriter.PyramidMode.SPARSE;
+        if (s.startsWith("Single")) return OmeTiffMergeWriter.PyramidMode.SINGLE;
+        return OmeTiffMergeWriter.PyramidMode.DYADIC;
     }
 
     /** Map the GUI dropdown label to an OMEPyramidWriter.CompressionType. */

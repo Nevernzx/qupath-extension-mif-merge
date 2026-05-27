@@ -20,6 +20,19 @@ public final class OmeTiffMergeWriter {
 
     private static final Logger logger = LoggerFactory.getLogger(OmeTiffMergeWriter.class);
 
+    /**
+     * Controls how many pyramid levels are emitted. More levels = smoother
+     * QuPath zoom navigation but more work to write.
+     */
+    public enum PyramidMode {
+        /** 1x, 2x, 4x, 8x, 16x, 32x — full dyadic pyramid, total work ~133% of level 0. */
+        DYADIC,
+        /** 1x, 4x, 16x — sparse, total work ~107% of level 0. Zoom in QuPath has some lag. */
+        SPARSE,
+        /** Only full resolution (1x), total work ~75% of dyadic. QuPath zoom feels sluggish. */
+        SINGLE
+    }
+
     public static final class Options {
         /**
          * Output tile size. 512 was the previous default; in practice that caused
@@ -29,8 +42,9 @@ public final class OmeTiffMergeWriter {
          * 1024 is a much better default — 4x fewer tiles, similar per-pixel work.
          */
         public int tileSize = 1024;
-        /** If null, use dyadic (1x, 2x, 4x, ...) downsamples; otherwise explicit list. */
+        /** Explicit pyramid downsamples; if non-null, overrides {@link #pyramidMode}. */
         public double[] downsamples = null;
+        public PyramidMode pyramidMode = PyramidMode.DYADIC;
         public OMEPyramidWriter.CompressionType compression = OMEPyramidWriter.CompressionType.LZW;
         /**
          * Number of writer threads.
@@ -61,8 +75,22 @@ public final class OmeTiffMergeWriter {
 
         if (opts.downsamples != null) {
             builder.downsamples(opts.downsamples);
+            logger.info("Pyramid: explicit downsamples = {}", java.util.Arrays.toString(opts.downsamples));
         } else {
-            builder.dyadicDownsampling();
+            switch (opts.pyramidMode) {
+                case DYADIC:
+                    builder.dyadicDownsampling();
+                    logger.info("Pyramid: dyadic (1, 2, 4, 8, 16, 32, ...)");
+                    break;
+                case SPARSE:
+                    builder.downsamples(1.0, 4.0, 16.0);
+                    logger.info("Pyramid: sparse (1, 4, 16)");
+                    break;
+                case SINGLE:
+                    builder.downsamples(1.0);
+                    logger.info("Pyramid: single level (full-res only, no pyramid)");
+                    break;
+            }
         }
         if (opts.nWriteThreads <= 0) {
             // Legacy "use all cores" behaviour
