@@ -45,6 +45,21 @@ public interface MifImageSource extends AutoCloseable {
      */
     BufferedImage readChannelAtLevel(int channelIndex, int level);
 
+    /**
+     * Read a sub-region of a channel at the given pyramid level.
+     *
+     * <p>Coordinates are in pixels of the chosen level (NOT full-res unless
+     * level=0). If the requested rectangle extends beyond the level's bounds
+     * it is clipped; the returned image is the clipped portion (so its
+     * dimensions can be smaller than {@code width}/{@code height}).
+     *
+     * <p>The returned image is autocontrasted to 8-bit gray exactly like
+     * {@link #readChannelAtLevel(int, int)}. Used by the windowed
+     * full-resolution refinement (Stage 3) so we don't have to load the
+     * full level-0 plane into memory.
+     */
+    BufferedImage readRegionAtLevel(int channelIndex, int level, int x, int y, int width, int height);
+
     /** A short description for logging — typically the underlying filename. */
     String getDisplayName();
 

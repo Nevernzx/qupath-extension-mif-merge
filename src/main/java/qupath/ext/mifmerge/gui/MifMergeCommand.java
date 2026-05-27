@@ -10,6 +10,7 @@ import javafx.scene.Scene;
 import javafx.scene.control.Alert;
 import javafx.scene.control.Button;
 import javafx.scene.control.ButtonType;
+import javafx.scene.control.CheckBox;
 import javafx.scene.control.Label;
 import javafx.scene.control.ListView;
 import javafx.scene.control.ProgressBar;
@@ -156,6 +157,12 @@ public final class MifMergeCommand implements Runnable {
         // for 6-GB Windows machines.
         Spinner<Integer> nFeaturesSpinner = new Spinner<>(2000, 100000, 60000, 5000);
 
+        // Stage 3: windowed full-resolution refinement (bounded memory)
+        CheckBox stage3Enable = new CheckBox("Enable Stage 3 (windowed full-res refinement, ~1 px precision)");
+        stage3Enable.setSelected(false);
+        Spinner<Integer> stage3NumWindows = new Spinner<>(4, 64, 16, 2);
+        Spinner<Integer> stage3WindowSize = new Spinner<>(512, 8192, 2048, 256);
+
         GridPane grid = new GridPane();
         grid.setHgap(8);
         grid.setVgap(6);
@@ -165,6 +172,9 @@ public final class MifMergeCommand implements Runnable {
         grid.addRow(2, new Label("Stage 1 long side (px):"), stage1Long);
         grid.addRow(3, new Label("Stage 2 long side (px):"), stage2Long);
         grid.addRow(4, new Label("SIFT keypoints per image:"), nFeaturesSpinner);
+        grid.add(stage3Enable, 0, 5, 2, 1);
+        grid.addRow(6, new Label("  Stage 3 windows:"), stage3NumWindows);
+        grid.addRow(7, new Label("  Stage 3 window size (px):"), stage3WindowSize);
         GridPane.setHgrow(outRow, Priority.ALWAYS);
 
         // --- Progress + log ---
@@ -214,6 +224,9 @@ public final class MifMergeCommand implements Runnable {
                     dapiField.getText(),
                     stage1Long.getValue(), stage2Long.getValue(),
                     nFeaturesSpinner.getValue(),
+                    stage3Enable.isSelected(),
+                    stage3NumWindows.getValue(),
+                    stage3WindowSize.getValue(),
                     log);
             task.setOnSucceeded(e -> Platform.runLater(() -> {
                 progress.setProgress(1.0);
@@ -247,7 +260,9 @@ public final class MifMergeCommand implements Runnable {
 
     private Task<Void> makeTask(List<File> files, String outPath,
                                 String dapiName, int stage1Long, int stage2Long,
-                                int nFeatures, TextArea log) {
+                                int nFeatures,
+                                boolean enableStage3, int stage3NumWindows, int stage3WindowSize,
+                                TextArea log) {
         return new Task<>() {
             @Override
             protected Void call() throws Exception {
@@ -291,6 +306,9 @@ public final class MifMergeCommand implements Runnable {
                     cfg.stage2TargetLongPx = stage2Long;
                     cfg.stage1Params.nFeatures(nFeatures);
                     cfg.stage2Params.nFeatures(nFeatures);
+                    cfg.enableStage3 = enableStage3;
+                    cfg.stage3.numWindows = stage3NumWindows;
+                    cfg.stage3.windowSizePx = stage3WindowSize;
 
                     for (int i = 1; i < bf.size(); i++) {
                         if (isCancelled()) return null;

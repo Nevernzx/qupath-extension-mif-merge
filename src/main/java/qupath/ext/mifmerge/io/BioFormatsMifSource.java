@@ -204,6 +204,54 @@ public final class BioFormatsMifSource implements MifImageSource {
     }
 
     @Override
+    public BufferedImage readRegionAtLevel(int channelIndex, int level,
+                                           int x, int y, int width, int height) {
+        synchronized (reader) {
+            reader.setResolution(level);
+            int levelW = reader.getSizeX();
+            int levelH = reader.getSizeY();
+            // Clip to level bounds
+            int x0 = Math.max(0, x);
+            int y0 = Math.max(0, y);
+            int x1 = Math.min(levelW, x + width);
+            int y1 = Math.min(levelH, y + height);
+            int w = Math.max(0, x1 - x0);
+            int h = Math.max(0, y1 - y0);
+            if (w == 0 || h == 0) {
+                throw new IllegalArgumentException(
+                        "Requested region [" + x + "," + y + "," + width + "," + height + "] "
+                                + "is fully outside level " + level + " bounds " + levelW + "x" + levelH);
+            }
+            int pixelType = reader.getPixelType();
+            int bytesPerPx = loci.formats.FormatTools.getBytesPerPixel(pixelType);
+            try {
+                int planeIndex = reader.getIndex(0, channelIndex, 0);
+                byte[] raw = reader.openBytes(planeIndex, x0, y0, w, h);
+                boolean isLittleEndian = reader.isLittleEndian();
+
+                switch (pixelType) {
+                    case loci.formats.FormatTools.UINT8:
+                    case loci.formats.FormatTools.INT8:
+                        return AutoContrast.stretchToByteGray(raw, w, h, pctLo, pctHi);
+                    case loci.formats.FormatTools.UINT16:
+                    case loci.formats.FormatTools.INT16: {
+                        short[] u16 = bytesToShorts(raw, isLittleEndian);
+                        return AutoContrast.stretchToByteGray(u16, w, h, pctLo, pctHi);
+                    }
+                    default:
+                        throw new UnsupportedOperationException(
+                                "Unsupported pixel type " + pixelType);
+                }
+            } catch (Exception e) {
+                throw new RuntimeException(
+                        "Failed to read region " + x + "," + y + "," + width + "x" + height
+                                + " of channel " + channelIndex + " at level " + level
+                                + " of " + displayName, e);
+            }
+        }
+    }
+
+    @Override
     public String getDisplayName() {
         return displayName;
     }

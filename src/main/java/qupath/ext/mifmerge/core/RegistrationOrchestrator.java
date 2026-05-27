@@ -38,6 +38,13 @@ public final class RegistrationOrchestrator {
         public SiftRansacAffine.Params stage1Params = new SiftRansacAffine.Params();
         public SiftRansacAffine.Params stage2Params = new SiftRansacAffine.Params()
                 .prefilterRadiusPx(30.0).ransacReprojThresholdPx(3.0);
+        /**
+         * Enable Stage 3 windowed full-resolution refinement. Bounded memory
+         * (~100 MB native per window) regardless of full-res image size.
+         * Refines the Stage 2 matrix from ~4-8 px @ full-res down to ~1 px.
+         */
+        public boolean enableStage3 = false;
+        public WindowedRefinement.Config stage3 = new WindowedRefinement.Config();
     }
 
     public static final class Result {
@@ -48,16 +55,20 @@ public final class RegistrationOrchestrator {
         public final TwoStageRegistration.Output stages;
         /** Final affine at FULL resolution, moving_full -> fixed_full. */
         public final double[][] matrixFullRes;
+        /** Stage 3 result if enabled, else null. */
+        public final WindowedRefinement.Result stage3;
 
         Result(int fdc, int mdc,
                DapiPyramidSelector.Selection s1Lvl, DapiPyramidSelector.Selection s2Lvl,
-               TwoStageRegistration.Output stages, double[][] matrixFullRes) {
+               TwoStageRegistration.Output stages, double[][] matrixFullRes,
+               WindowedRefinement.Result stage3) {
             this.fixedDapiChannel = fdc;
             this.movingDapiChannel = mdc;
             this.stage1Levels = s1Lvl;
             this.stage2Levels = s2Lvl;
             this.stages = stages;
             this.matrixFullRes = matrixFullRes;
+            this.stage3 = stage3;
         }
     }
 
@@ -180,7 +191,26 @@ public final class RegistrationOrchestrator {
                     String.format("%+.6e", matrixFullRes[i][2]));
         }
 
-        return new Result(fdc, mdc, s1, s2, stages, matrixFullRes);
+        // Optional Stage 3: windowed full-resolution refinement
+        WindowedRefinement.Result stage3 = null;
+        double[][] finalMatrix = matrixFullRes;
+        if (cfg.enableStage3) {
+            say.accept("orchestrator: starting Stage 3 windowed refinement");
+            try {
+                stage3 = WindowedRefinement.run(
+                        fixed, moving, fdc, mdc, matrixFullRes, s1Fixed, cfg.stage3, uiLog);
+                finalMatrix = stage3.refinedMatrixFullRes;
+                say.accept(String.format(
+                        "orchestrator: Stage 3 done — refined %d inliers, median %.2fpx @full-res",
+                        stage3.finalInliers, stage3.reprojMedianPx));
+            } catch (Throwable t) {
+                say.accept("orchestrator: Stage 3 failed: " + t.getMessage()
+                        + " — keeping Stage 2 matrix");
+                logger.warn("Stage 3 failed, keeping Stage 2 matrix", t);
+            }
+        }
+
+        return new Result(fdc, mdc, s1, s2, stages, finalMatrix, stage3);
     }
 
     private static String arrToStr(double[] arr) {
