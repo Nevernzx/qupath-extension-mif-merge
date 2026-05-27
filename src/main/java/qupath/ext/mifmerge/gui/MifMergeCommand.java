@@ -183,6 +183,11 @@ public final class MifMergeCommand implements Runnable {
                 "J2K_LOSSY (smallest file, minor quality loss)");
         compressionChoice.setValue("LZW (lossless, default)");
         Spinner<Integer> tileSizeSpinner = new Spinner<>(256, 4096, 1024, 256);
+        // Concurrent writer threads — each thread holds tile buffers for
+        // fixed + all moving channels, so this is the main lever for write-
+        // phase memory usage. Default 2 keeps memory bounded; raise to 4 for
+        // ~30% faster write on a machine with plenty of RAM.
+        Spinner<Integer> writeThreadsSpinner = new Spinner<>(1, 16, 2, 1);
 
         GridPane grid = new GridPane();
         grid.setHgap(8);
@@ -198,6 +203,7 @@ public final class MifMergeCommand implements Runnable {
         grid.addRow(7, new Label("  Stage 3 window size (px):"), stage3WindowSize);
         grid.addRow(8, new Label("OME-TIFF compression:"), compressionChoice);
         grid.addRow(9, new Label("OME-TIFF tile size (px):"), tileSizeSpinner);
+        grid.addRow(10, new Label("OME-TIFF write threads:"), writeThreadsSpinner);
         GridPane.setHgrow(outRow, Priority.ALWAYS);
 
         // --- Progress + log ---
@@ -267,6 +273,7 @@ public final class MifMergeCommand implements Runnable {
                     stage3WindowSize.getValue(),
                     compressionFromChoice(compressionChoice.getValue()),
                     tileSizeSpinner.getValue(),
+                    writeThreadsSpinner.getValue(),
                     log);
             // Bind the progress bar + status label to the Task's progress/message.
             // Task#updateProgress and #updateMessage (called from the worker thread)
@@ -330,6 +337,7 @@ public final class MifMergeCommand implements Runnable {
                                 int nFeatures,
                                 boolean enableStage3, int stage3NumWindows, int stage3WindowSize,
                                 OMEPyramidWriter.CompressionType compression, int tileSize,
+                                int nWriteThreads,
                                 TextArea log) {
         return new Task<>() {
             @Override
@@ -473,13 +481,22 @@ public final class MifMergeCommand implements Runnable {
                     updateProgress(0.70, 1);
                     updateMessage("Writing OME-TIFF (this is usually the slowest step)…");
                     appendLog(log, "  Writing OME-TIFF: " + outPath);
-                    appendLog(log, String.format("  Compression=%s, tileSize=%d",
-                            compression, tileSize));
+                    appendLog(log, String.format("  Compression=%s, tileSize=%d, writeThreads=%d",
+                            compression, tileSize, nWriteThreads));
                     OmeTiffMergeWriter.Options writeOpts = new OmeTiffMergeWriter.Options();
                     writeOpts.compression = compression;
                     writeOpts.tileSize = tileSize;
+                    writeOpts.nWriteThreads = nWriteThreads;
                     OmeTiffMergeWriter.write(merged, outPath, writeOpts);
                     appendLog(log, "Done.");
+
+                    // Hint the JVM to release tile cache + Bio-Formats buffers now
+                    // that we're done with them. Without this, the memory bump from
+                    // the write phase can stay parked until the next major GC.
+                    merged = null;
+                    System.gc();
+                    logMem(log, "after write + GC");
+
                     updateProgress(1.0, 1);
                     updateMessage("Done.");
                     return null;

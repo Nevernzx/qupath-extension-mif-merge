@@ -32,7 +32,16 @@ public final class OmeTiffMergeWriter {
         /** If null, use dyadic (1x, 2x, 4x, ...) downsamples; otherwise explicit list. */
         public double[] downsamples = null;
         public OMEPyramidWriter.CompressionType compression = OMEPyramidWriter.CompressionType.LZW;
-        public boolean parallelize = true;
+        /**
+         * Number of writer threads.
+         *  - 1: serial, lowest memory
+         *  - 2-4: typical sweet spot for desktop machines (each thread holds tile
+         *    buffers for fixed + all moving channels, so cost scales linearly)
+         *  - 0 or negative: use {@link Runtime#availableProcessors()}, the old
+         *    'parallelize()' default — on 8-core systems that can hold ~1-2 GB of
+         *    tile data in flight at any time.
+         */
+        public int nWriteThreads = 2;
         public boolean bigTiff = true;
     }
 
@@ -55,8 +64,17 @@ public final class OmeTiffMergeWriter {
         } else {
             builder.dyadicDownsampling();
         }
-        if (opts.parallelize) {
+        if (opts.nWriteThreads <= 0) {
+            // Legacy "use all cores" behaviour
             builder.parallelize();
+            logger.info("OME-TIFF writer threads: availableProcessors ({})",
+                    Runtime.getRuntime().availableProcessors());
+        } else if (opts.nWriteThreads == 1) {
+            builder.parallelize(false);
+            logger.info("OME-TIFF writer threads: 1 (serial)");
+        } else {
+            builder.parallelize(opts.nWriteThreads);
+            logger.info("OME-TIFF writer threads: {}", opts.nWriteThreads);
         }
         if (opts.bigTiff) {
             builder.bigTiff();
