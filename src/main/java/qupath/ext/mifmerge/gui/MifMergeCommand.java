@@ -28,8 +28,14 @@ import javafx.stage.Stage;
 import javafx.stage.Window;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import qupath.ext.mifmerge.core.MatrixRescaler;
+import qupath.ext.mifmerge.qc.QcVisualizer;
 
 import java.awt.Toolkit;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Locale;
 import qupath.ext.mifmerge.core.MergedChannelLayout;
 import qupath.ext.mifmerge.core.MifImageSource;
 import qupath.ext.mifmerge.core.RegistrationOrchestrator;
@@ -382,6 +388,17 @@ public final class MifMergeCommand implements Runnable {
                                 r.matrixFullRes[0][1], r.matrixFullRes[1][1],
                                 r.matrixFullRes[0][2], r.matrixFullRes[1][2]);
                         movingAffines.add(aff);
+
+                        // Per-pair diagnostics: matrix files + QC PNGs alongside the OME-TIFF.
+                        // Don't fail the whole task if diagnostics write fails — just warn.
+                        try {
+                            writePairDiagnostics(outPath, files.get(0), files.get(i),
+                                    i, nPairs, r, bf.get(0), bf.get(i), log);
+                        } catch (Throwable t) {
+                            appendLog(log, "  warning: failed to write diagnostics: " + t.getMessage());
+                            logger.warn("Failed to write pair {} diagnostics", i, t);
+                        }
+
                         logMem(log, "after registering pair " + i);
                         updateProgress(pairEndProgress, 1);
                     }
@@ -449,6 +466,130 @@ public final class MifMergeCommand implements Runnable {
         long used = (rt.totalMemory() - rt.freeMemory()) / (1024L * 1024L);
         long heapMax = rt.maxMemory() / (1024L * 1024L);
         appendLog(log, String.format("  [mem] %s: heap used %d MB / max %d MB", label, used, heapMax));
+    }
+
+    /**
+     * Write per-pair diagnostic files next to the output OME-TIFF:
+     *   <stem>[-pairN-]matrix_full_res.json
+     *   <stem>[-pairN-]matrices.txt
+     *   <stem>[-pairN-]qc_{checkerboard,abs_diff,overlay}.png
+     */
+    private static void writePairDiagnostics(String outOmeTiffPath,
+                                             File fixedFile, File movingFile,
+                                             int pairIndex, int totalPairs,
+                                             RegistrationOrchestrator.Result r,
+                                             MifImageSource bfFixed, MifImageSource bfMoving,
+                                             TextArea log) throws IOException {
+        Path omePath = Path.of(outOmeTiffPath).toAbsolutePath();
+        Path outDir = omePath.getParent();
+        if (outDir == null) outDir = Path.of(".");
+        // Strip .ome.tif / .ome.tiff / .tif / .tiff
+        String stem = omePath.getFileName().toString();
+        for (String suf : new String[] {".ome.tiff", ".ome.tif", ".tiff", ".tif"}) {
+            if (stem.toLowerCase().endsWith(suf)) {
+                stem = stem.substring(0, stem.length() - suf.length());
+                break;
+            }
+        }
+        String prefix = totalPairs > 1
+                ? stem + "-pair" + pairIndex + "-"
+                : stem + "-";
+
+        Path matJson = outDir.resolve(prefix + "matrix_full_res.json");
+        Path matTxt  = outDir.resolve(prefix + "matrices.txt");
+        Files.writeString(matJson, matrixJson(r));
+        Files.writeString(matTxt, matrixTxt(fixedFile, movingFile, r));
+        appendLog(log, "    wrote " + matJson.getFileName() + " + " + matTxt.getFileName());
+
+        // QC PNGs: re-read stage 1 DAPI (cheap, ~16 MB each) and warp moving via stage 1 matrix.
+        BufferedImage s1Fixed = bfFixed.readChannelAtLevel(r.fixedDapiChannel, r.stage1Levels.levelFixed);
+        BufferedImage s1Moving = bfMoving.readChannelAtLevel(r.movingDapiChannel, r.stage1Levels.levelMoving);
+        AffineTransform affS1 = MatrixRescaler.toAffineTransform(r.stages.stage1.matrix);
+        QcVisualizer.write(s1Fixed, s1Moving, affS1, outDir, prefix);
+        appendLog(log, "    wrote " + prefix + "qc_{checkerboard,abs_diff,overlay}.png");
+    }
+
+    private static String matrixJson(RegistrationOrchestrator.Result r) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("{\n");
+        sb.append("  \"matrix_full_res\": ").append(matrixArrJson(r.matrixFullRes)).append(",\n");
+        sb.append("  \"matrix_stage2\": ").append(matrixArrJson(r.stages.matrixAtStage2Resolution)).append(",\n");
+        sb.append("  \"matrix_stage1\": ").append(matrixArrJson(r.stages.stage1.matrix)).append(",\n");
+        sb.append("  \"stage1_inliers\": ").append(r.stages.stage1.nInliers).append(",\n");
+        sb.append("  \"stage1_reproj_median_px\": ").append(String.format(Locale.ROOT, "%.4f", r.stages.stage1.medianReprojErrPx)).append(",\n");
+        sb.append("  \"stage2_inliers\": ").append(r.stages.stage2.nInliers).append(",\n");
+        sb.append("  \"stage2_reproj_median_px\": ").append(String.format(Locale.ROOT, "%.4f", r.stages.stage2.medianReprojErrPx)).append(",\n");
+        if (r.stage3 != null) {
+            sb.append("  \"stage3_enabled\": true,\n");
+            sb.append("  \"stage3_inliers\": ").append(r.stage3.finalInliers).append(",\n");
+            sb.append("  \"stage3_total_point_pairs\": ").append(r.stage3.totalPointPairs).append(",\n");
+            sb.append("  \"stage3_reproj_median_full_res_px\": ").append(String.format(Locale.ROOT, "%.4f", r.stage3.reprojMedianPx)).append(",\n");
+            sb.append("  \"stage3_windows_succeeded\": ").append(r.stage3.windowsSucceeded).append(",\n");
+        } else {
+            sb.append("  \"stage3_enabled\": false,\n");
+        }
+        sb.append("  \"fixed_dapi_channel\": ").append(r.fixedDapiChannel).append(",\n");
+        sb.append("  \"moving_dapi_channel\": ").append(r.movingDapiChannel).append("\n");
+        sb.append("}\n");
+        return sb.toString();
+    }
+
+    private static String matrixArrJson(double[][] m) {
+        StringBuilder sb = new StringBuilder("[");
+        for (int i = 0; i < 3; i++) {
+            sb.append("[");
+            for (int j = 0; j < 3; j++) {
+                sb.append(String.format(Locale.ROOT, "%.10e", m[i][j]));
+                if (j < 2) sb.append(", ");
+            }
+            sb.append(i < 2 ? "], " : "]");
+        }
+        sb.append("]");
+        return sb.toString();
+    }
+
+    private static String matrixTxt(File fixedFile, File movingFile, RegistrationOrchestrator.Result r) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("Fixed : ").append(fixedFile.getName()).append("\n");
+        sb.append("Moving: ").append(movingFile.getName()).append("\n\n");
+
+        sb.append("Stage 1 (coarse): ").append(r.stage1Levels).append("\n");
+        sb.append(String.format(Locale.ROOT, "  inliers=%d/%d (%.1f%%), reproj median=%.2fpx p95=%.2fpx%n",
+                r.stages.stage1.nInliers, r.stages.stage1.nMatchesPostPrefilter,
+                100.0 * r.stages.stage1.inlierRatio,
+                r.stages.stage1.medianReprojErrPx, r.stages.stage1.p95ReprojErrPx));
+
+        sb.append("Stage 2 (refine): ").append(r.stage2Levels).append("\n");
+        sb.append(String.format(Locale.ROOT, "  inliers=%d/%d (%.1f%%), reproj median=%.2fpx p95=%.2fpx%n",
+                r.stages.stage2.nInliers, r.stages.stage2.nMatchesPostPrefilter,
+                100.0 * r.stages.stage2.inlierRatio,
+                r.stages.stage2.medianReprojErrPx, r.stages.stage2.p95ReprojErrPx));
+
+        if (r.stage3 != null) {
+            sb.append("Stage 3 (windowed full-res):\n");
+            sb.append(String.format(Locale.ROOT,
+                    "  inliers=%d/%d (%.1f%%), reproj median=%.2fpx p95=%.2fpx @full-res, %d/%d windows succeeded%n",
+                    r.stage3.finalInliers, r.stage3.totalPointPairs,
+                    100.0 * r.stage3.inlierRatio,
+                    r.stage3.reprojMedianPx, r.stage3.reprojP95Px,
+                    r.stage3.windowsSucceeded, r.stage3.windowsAttempted));
+        }
+
+        sb.append("\nFULL-RESOLUTION matrix (moving_full -> fixed_full):\n");
+        for (int i = 0; i < 3; i++) {
+            sb.append(String.format(Locale.ROOT, "  [%+.6e %+.6e %+.6e]%n",
+                    r.matrixFullRes[i][0], r.matrixFullRes[i][1], r.matrixFullRes[i][2]));
+        }
+        double a = r.matrixFullRes[0][0], b = r.matrixFullRes[0][1];
+        double c = r.matrixFullRes[1][0], d = r.matrixFullRes[1][1];
+        sb.append("\nAffine decomposition:\n");
+        sb.append(String.format(Locale.ROOT, "  rotation   ~ %+.4f deg%n",
+                Math.toDegrees(Math.atan2(c, a))));
+        sb.append(String.format(Locale.ROOT, "  scale x/y  ~ %.5f / %.5f%n",
+                Math.hypot(a, c), Math.hypot(b, d)));
+        sb.append(String.format(Locale.ROOT, "  translation~ (%+.1f, %+.1f) px%n",
+                r.matrixFullRes[0][2], r.matrixFullRes[1][2]));
+        return sb.toString();
     }
 
     private static void appendLog(TextArea log, String line) {

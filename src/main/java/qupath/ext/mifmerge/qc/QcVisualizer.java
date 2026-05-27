@@ -48,6 +48,17 @@ public final class QcVisualizer {
      */
     public static void write(BufferedImage fixed, BufferedImage moving,
                              AffineTransform affine, Path outDir) throws IOException {
+        write(fixed, moving, affine, outDir, "");
+    }
+
+    /**
+     * Same as {@link #write(BufferedImage, BufferedImage, AffineTransform, Path)}
+     * but each filename is prefixed with {@code prefix} (so multiple pairs can
+     * share an output directory).
+     */
+    public static void write(BufferedImage fixed, BufferedImage moving,
+                             AffineTransform affine, Path outDir,
+                             String prefix) throws IOException {
         outDir.toFile().mkdirs();
 
         // Warp moving into fixed frame at fixed resolution
@@ -56,17 +67,15 @@ public final class QcVisualizer {
         AffineTransformOp op = new AffineTransformOp(affine, AffineTransformOp.TYPE_BILINEAR);
         op.filter(moving, warped);
 
-        write(outDir.resolve("qc_checkerboard.png").toFile(),
+        String p = prefix == null ? "" : prefix;
+        write(outDir.resolve(p + "qc_checkerboard.png").toFile(),
                 checkerboard(fixed, warped));
-        write(outDir.resolve("qc_abs_diff.png").toFile(),
+        write(outDir.resolve(p + "qc_abs_diff.png").toFile(),
                 absDiff(fixed, warped, 4.0));
-        write(outDir.resolve("qc_overlay.png").toFile(),
+        write(outDir.resolve(p + "qc_overlay.png").toFile(),
                 magentaGreenOverlay(fixed, warped));
 
-        logger.info("Wrote QC: {} {} {}",
-                outDir.resolve("qc_checkerboard.png"),
-                outDir.resolve("qc_abs_diff.png"),
-                outDir.resolve("qc_overlay.png"));
+        logger.info("Wrote QC: {}{qc_checkerboard,qc_abs_diff,qc_overlay}.png", outDir.resolve(p));
     }
 
     static BufferedImage checkerboard(BufferedImage fixed, BufferedImage warped) {
