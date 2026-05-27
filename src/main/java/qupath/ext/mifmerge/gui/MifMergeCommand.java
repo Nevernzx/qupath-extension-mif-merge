@@ -6,6 +6,7 @@ import javafx.collections.FXCollections;
 import javafx.collections.ObservableList;
 import javafx.concurrent.Task;
 import javafx.geometry.Insets;
+import javafx.geometry.Pos;
 import javafx.scene.Scene;
 import javafx.scene.control.Alert;
 import javafx.scene.control.Button;
@@ -27,6 +28,8 @@ import javafx.stage.Stage;
 import javafx.stage.Window;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import java.awt.Toolkit;
 import qupath.ext.mifmerge.core.MergedChannelLayout;
 import qupath.ext.mifmerge.core.MifImageSource;
 import qupath.ext.mifmerge.core.RegistrationOrchestrator;
@@ -183,6 +186,10 @@ public final class MifMergeCommand implements Runnable {
         log.setPrefRowCount(10);
         ProgressBar progress = new ProgressBar(0);
         progress.setPrefWidth(Double.MAX_VALUE);
+        Label statusLabel = new Label("Idle. Add qptiff files, set output path, then Run merge.");
+        statusLabel.setStyle("-fx-font-weight: bold;");
+        HBox progressRow = new HBox(8, statusLabel);
+        progressRow.setAlignment(Pos.CENTER_LEFT);
 
         // --- Bottom row: Run + Close ---
         Button runBtn = new Button("Run merge");
@@ -195,6 +202,7 @@ public final class MifMergeCommand implements Runnable {
                 fileButtons,
                 grid,
                 new Label("Progress:"),
+                progressRow,
                 progress,
                 log,
                 bottomRow);
@@ -216,8 +224,8 @@ public final class MifMergeCommand implements Runnable {
                 return;
             }
             runBtn.setDisable(true);
-            progress.setProgress(ProgressBar.INDETERMINATE_PROGRESS);
             log.clear();
+            long taskStart = System.currentTimeMillis();
 
             Task<Void> task = makeTask(
                     new ArrayList<>(files), outPath,
@@ -228,17 +236,44 @@ public final class MifMergeCommand implements Runnable {
                     stage3NumWindows.getValue(),
                     stage3WindowSize.getValue(),
                     log);
+            // Bind the progress bar + status label to the Task's progress/message.
+            // Task#updateProgress and #updateMessage (called from the worker thread)
+            // are thread-safe and update these properties on the FX thread.
+            progress.progressProperty().bind(task.progressProperty());
+            statusLabel.textProperty().bind(task.messageProperty());
+
             task.setOnSucceeded(e -> Platform.runLater(() -> {
+                // Unbind so we can override
+                progress.progressProperty().unbind();
+                statusLabel.textProperty().unbind();
                 progress.setProgress(1.0);
+                long elapsed = (System.currentTimeMillis() - taskStart) / 1000;
+                statusLabel.setText(String.format(" ✓ Merge complete in %ds", elapsed));
+                statusLabel.setStyle("-fx-font-weight: bold; -fx-text-fill: #2a8000;");
                 runBtn.setDisable(false);
-                showInfo(stage, "Merge complete:\n" + outPath);
+                // Audible cue
+                try { Toolkit.getDefaultToolkit().beep(); } catch (Throwable ignored) {}
+                showSuccessAlert(stage, outPath, elapsed);
             }));
             task.setOnFailed(e -> Platform.runLater(() -> {
+                progress.progressProperty().unbind();
+                statusLabel.textProperty().unbind();
                 progress.setProgress(0);
+                statusLabel.setText(" ✗ Failed");
+                statusLabel.setStyle("-fx-font-weight: bold; -fx-text-fill: #c00000;");
                 runBtn.setDisable(false);
                 Throwable t = task.getException();
                 logger.error("MIF Merge failed", t);
+                try { Toolkit.getDefaultToolkit().beep(); } catch (Throwable ignored) {}
                 showError(stage, "Failed: " + (t == null ? "(no exception)" : t.getMessage()));
+            }));
+            task.setOnCancelled(e -> Platform.runLater(() -> {
+                progress.progressProperty().unbind();
+                statusLabel.textProperty().unbind();
+                progress.setProgress(0);
+                statusLabel.setText(" — Cancelled");
+                statusLabel.setStyle("-fx-font-weight: bold;");
+                runBtn.setDisable(false);
             }));
             currentTask.set(task);
             Thread thr = new Thread(task, "mif-merge-task");
@@ -283,14 +318,25 @@ public final class MifMergeCommand implements Runnable {
                 List<List<String>> channelNamesPerSource = new ArrayList<>();
                 List<String> labels = new ArrayList<>();
 
+                // Rough progress milestones:
+                //   0.00 - 0.05: open Bio-Formats readers
+                //   0.05 - 0.60: register (Stage 1+2 [+ optional Stage 3])
+                //   0.60 - 0.65: open QuPath ImageServers
+                //   0.65 - 0.95: write OME-TIFF
+                //   0.95 - 1.00: cleanup
+                updateProgress(0, 1);
+                updateMessage("Opening Bio-Formats readers…");
+
                 // -------- Phase A: registration --------
                 appendLog(log, "Phase A: register (lightweight readers only)");
                 logMem(log, "before opening Bio-Formats readers");
                 List<MifImageSource> bf = new ArrayList<>();
                 try {
-                    for (File f : files) {
+                    for (int fi = 0; fi < files.size(); fi++) {
+                        File f = files.get(fi);
                         appendLog(log, "  Opening " + f.getName());
                         bf.add(new BioFormatsMifSource(f));
+                        updateProgress(0.05 * (fi + 1) / files.size(), 1);
                     }
                     logMem(log, "after opening all Bio-Formats readers");
                     if (isCancelled()) return null;
@@ -310,8 +356,15 @@ public final class MifMergeCommand implements Runnable {
                     cfg.stage3.numWindows = stage3NumWindows;
                     cfg.stage3.windowSizePx = stage3WindowSize;
 
+                    int nPairs = bf.size() - 1;
                     for (int i = 1; i < bf.size(); i++) {
                         if (isCancelled()) return null;
+                        updateMessage(String.format("Registering pair %d/%d (Stage 1+2%s)…",
+                                i, nPairs, enableStage3 ? "+3" : ""));
+                        double pairStartProgress = 0.05 + 0.55 * (i - 1) / nPairs;
+                        double pairEndProgress = 0.05 + 0.55 * i / nPairs;
+                        updateProgress(pairStartProgress, 1);
+
                         appendLog(log, String.format("  Registering %s -> %s",
                                 files.get(i).getName(), files.get(0).getName()));
                         RegistrationOrchestrator.Result r = RegistrationOrchestrator.run(
@@ -319,12 +372,18 @@ public final class MifMergeCommand implements Runnable {
                         appendLog(log, String.format("    stage 2 inliers %d/%d, reproj median %.2fpx @L2",
                                 r.stages.stage2.nInliers, r.stages.stage2.nMatchesPostPrefilter,
                                 r.stages.stage2.medianReprojErrPx));
+                        if (r.stage3 != null) {
+                            appendLog(log, String.format("    stage 3 inliers %d/%d, reproj median %.2fpx @full-res",
+                                    r.stage3.finalInliers, r.stage3.totalPointPairs,
+                                    r.stage3.reprojMedianPx));
+                        }
                         AffineTransform aff = new AffineTransform(
                                 r.matrixFullRes[0][0], r.matrixFullRes[1][0],
                                 r.matrixFullRes[0][1], r.matrixFullRes[1][1],
                                 r.matrixFullRes[0][2], r.matrixFullRes[1][2]);
                         movingAffines.add(aff);
                         logMem(log, "after registering pair " + i);
+                        updateProgress(pairEndProgress, 1);
                     }
                 } finally {
                     for (MifImageSource s : bf) {
@@ -338,13 +397,17 @@ public final class MifMergeCommand implements Runnable {
                 if (isCancelled()) return null;
 
                 // -------- Phase B: merge + write --------
+                updateProgress(0.60, 1);
+                updateMessage("Opening QuPath ImageServers…");
                 appendLog(log, "Phase B: merge + write OME-TIFF");
                 List<ImageServer<BufferedImage>> qp = new ArrayList<>();
                 try {
-                    for (File f : files) {
+                    for (int fi = 0; fi < files.size(); fi++) {
+                        File f = files.get(fi);
                         appendLog(log, "  Opening QuPath ImageServer for " + f.getName());
                         qp.add(ImageServerProvider.buildServer(f.getAbsolutePath(),
                                 BufferedImage.class));
+                        updateProgress(0.60 + 0.05 * (fi + 1) / files.size(), 1);
                     }
                     logMem(log, "after opening QuPath ImageServers");
 
@@ -354,6 +417,8 @@ public final class MifMergeCommand implements Runnable {
                                 movingAffines.get(i)));
                     }
 
+                    updateProgress(0.65, 1);
+                    updateMessage("Building merged virtual server…");
                     List<MergedChannelLayout.ChannelEntry> layout =
                             MergedChannelLayout.build(channelNamesPerSource, labels, dapiName);
                     appendLog(log, "  Merged layout has " + layout.size() + " channels");
@@ -361,9 +426,13 @@ public final class MifMergeCommand implements Runnable {
                     ImageServer<BufferedImage> merged = MergedServerFactory.build(
                             qp.get(0), moving, layout);
 
+                    updateProgress(0.70, 1);
+                    updateMessage("Writing OME-TIFF (this is usually the slowest step)…");
                     appendLog(log, "  Writing OME-TIFF: " + outPath);
                     OmeTiffMergeWriter.write(merged, outPath, new OmeTiffMergeWriter.Options());
                     appendLog(log, "Done.");
+                    updateProgress(1.0, 1);
+                    updateMessage("Done.");
                     return null;
                 } finally {
                     for (ImageServer<BufferedImage> s : qp) {
@@ -409,6 +478,22 @@ public final class MifMergeCommand implements Runnable {
     private static void showInfo(Window owner, String msg) {
         Alert a = new Alert(Alert.AlertType.INFORMATION, msg, ButtonType.OK);
         if (owner != null) a.initOwner(owner);
+        a.showAndWait();
+    }
+
+    /**
+     * A more prominent success alert: shows the output path, elapsed time, and a
+     * brief hint to open the file in QuPath. Made bold/colored so the user
+     * notices it immediately, with an audible beep that precedes it.
+     */
+    private static void showSuccessAlert(Window owner, String outPath, long elapsedSec) {
+        Alert a = new Alert(Alert.AlertType.INFORMATION);
+        a.setTitle("MIF Merge — Done");
+        a.setHeaderText(String.format("Merge complete in %d seconds.", elapsedSec));
+        a.setContentText("Output written to:\n  " + outPath
+                + "\n\nOpen it via File > Open in QuPath to view the merged channels.");
+        if (owner != null) a.initOwner(owner);
+        a.getDialogPane().setMinWidth(500);
         a.showAndWait();
     }
 }
