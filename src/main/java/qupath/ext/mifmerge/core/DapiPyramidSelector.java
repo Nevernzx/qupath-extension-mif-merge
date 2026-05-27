@@ -52,10 +52,18 @@ public final class DapiPyramidSelector {
     }
 
     /**
+     * Pick a pyramid level for each side. The strategy errs on the side of
+     * memory safety: prefer a slightly-smaller image over a slightly-larger
+     * one. The resulting image is no more than ~20% larger than the user's
+     * target, even if that means going 50% smaller — bigger images make
+     * OpenCV SIFT allocate proportional-to-area native memory, so a 1.5x
+     * image is 2.25x the memory.
+     *
      * @param fixedFullSideLengthPx  the longer side of the fixed full-resolution image
      * @param movingFullSideLengthPx the longer side of the moving full-resolution image
      * @param targetSideLengthPx     desired thumbnail/refinement long-side
-     * @param fixedDownsamples       downsamples array from the fixed server (server.getPreferredDownsamples())
+     * @param fixedDownsamples       downsamples array from the fixed server
+     *                               (server.getPreferredDownsamples())
      * @param movingDownsamples      downsamples array from the moving server
      */
     public static Selection pick(double fixedFullSideLengthPx,
@@ -63,27 +71,32 @@ public final class DapiPyramidSelector {
                                  double targetSideLengthPx,
                                  double[] fixedDownsamples,
                                  double[] movingDownsamples) {
-        double targetDownsampleFixed = fixedFullSideLengthPx / targetSideLengthPx;
-        double targetDownsampleMoving = movingFullSideLengthPx / targetSideLengthPx;
+        // Prefer image_size <= target * 1.2, i.e. downsample >= full / (target * 1.2)
+        double maxAcceptableImage = targetSideLengthPx * 1.2;
+        double minDownsampleFixed = fixedFullSideLengthPx / maxAcceptableImage;
+        double minDownsampleMoving = movingFullSideLengthPx / maxAcceptableImage;
 
-        int lf = nearest(fixedDownsamples, targetDownsampleFixed);
-        int lm = nearest(movingDownsamples, targetDownsampleMoving);
+        int lf = firstAtLeast(fixedDownsamples, minDownsampleFixed);
+        int lm = firstAtLeast(movingDownsamples, minDownsampleMoving);
         return new Selection(lf, lm, fixedDownsamples[lf], movingDownsamples[lm]);
     }
 
-    private static int nearest(double[] downsamples, double target) {
+    /**
+     * Returns the smallest index {@code i} such that {@code downsamples[i] >= min}.
+     * Falls back to the last index if no entry is large enough (i.e., the target
+     * side length is bigger than the full image — caller asked for an unreasonable
+     * size, just give them the coarsest level we have).
+     */
+    private static int firstAtLeast(double[] downsamples, double min) {
         if (downsamples == null || downsamples.length == 0) {
             throw new IllegalArgumentException("downsamples must be non-empty");
         }
-        int best = 0;
-        double bestDiff = Math.abs(downsamples[0] - target);
-        for (int i = 1; i < downsamples.length; i++) {
-            double d = Math.abs(downsamples[i] - target);
-            if (d < bestDiff) {
-                bestDiff = d;
-                best = i;
+        for (int i = 0; i < downsamples.length; i++) {
+            if (downsamples[i] >= min) {
+                return i;
             }
         }
-        return best;
+        // No level downsamples enough; use the coarsest (largest downsample) available.
+        return downsamples.length - 1;
     }
 }
