@@ -142,6 +142,15 @@ public final class BioFormatsMifSource implements MifImageSource {
         }
     }
 
+    /** Tile size for sub-region reads. Bio-Formats handles arbitrary sizes; 1024 is a sane default. */
+    private static final int TILE_SIZE = 1024;
+
+    /**
+     * Safety cap so a misconfigured pyramid level can't ask us to allocate >2 GB.
+     * If hit, throws immediately instead of OOM-ing the JVM / native heap.
+     */
+    private static final long MAX_PIXELS_PER_PLANE = 2L * 1024 * 1024 * 1024 / 2;   // 2 GB / 2 bytes-per-px ≈ 1 G pixels
+
     @Override
     public BufferedImage readChannelAtLevel(int channelIndex, int level) {
         synchronized (reader) {
@@ -149,22 +158,36 @@ public final class BioFormatsMifSource implements MifImageSource {
             int w = reader.getSizeX();
             int h = reader.getSizeY();
             int pixelType = reader.getPixelType();
+            int bytesPerPx = loci.formats.FormatTools.getBytesPerPixel(pixelType);
+            long pixels = (long) w * (long) h;
+            long bytesAtFullDepth = pixels * bytesPerPx;
+            logger.info("readChannelAtLevel(ch={}, level={}) -> dims {}x{}, pixelType={}, "
+                            + "{} px = {} MB at {}-byte depth — reading by {} px tiles",
+                    channelIndex, level, w, h,
+                    loci.formats.FormatTools.getPixelTypeString(pixelType),
+                    pixels, bytesAtFullDepth / (1024L * 1024L), bytesPerPx, TILE_SIZE);
+            if (pixels > MAX_PIXELS_PER_PLANE) {
+                throw new RuntimeException(String.format(
+                        "Refusing to read %d × %d = %d pixels at level %d of %s "
+                                + "(over %d pixel cap). Did the pyramid level selector pick the wrong layer? "
+                                + "Try a smaller stage1/stage2 long-side in the GUI.",
+                        w, h, pixels, level, displayName, MAX_PIXELS_PER_PLANE));
+            }
             int z = 0;
             int t = 0;
             try {
                 int planeIndex = reader.getIndex(z, channelIndex, t);
-                byte[] raw = reader.openBytes(planeIndex);
                 boolean isLittleEndian = reader.isLittleEndian();
-                logger.debug("readChannelAtLevel({}, {}) -> {}x{}, pixelType={}, {} bytes",
-                        channelIndex, level, w, h, pixelType, raw.length);
 
                 switch (pixelType) {
                     case loci.formats.FormatTools.UINT8:
-                    case loci.formats.FormatTools.INT8:
-                        return AutoContrast.stretchToByteGray(raw, w, h, pctLo, pctHi);
+                    case loci.formats.FormatTools.INT8: {
+                        byte[] full = readPlaneTiled(planeIndex, w, h, bytesPerPx);
+                        return AutoContrast.stretchToByteGray(full, w, h, pctLo, pctHi);
+                    }
                     case loci.formats.FormatTools.UINT16:
                     case loci.formats.FormatTools.INT16: {
-                        short[] u16 = bytesToShorts(raw, isLittleEndian);
+                        short[] u16 = readPlaneTiledAsShorts(planeIndex, w, h, isLittleEndian);
                         return AutoContrast.stretchToByteGray(u16, w, h, pctLo, pctHi);
                     }
                     default:
@@ -201,6 +224,44 @@ public final class BioFormatsMifSource implements MifImageSource {
         short[] out = new short[sb.remaining()];
         sb.get(out);
         return out;
+    }
+
+    /**
+     * Read an entire plane by iterating over {@link #TILE_SIZE}-px tiles and copying
+     * pixel bytes into a single result array. This bounds transient memory to roughly
+     * one tile per iteration rather than the full plane.
+     *
+     * <p>Used only for 1- or 2-byte pixel types — the result array is the full plane.
+     */
+    private byte[] readPlaneTiled(int planeIndex, int width, int height, int bytesPerPx)
+            throws Exception {
+        long total = (long) width * height * bytesPerPx;
+        if (total > Integer.MAX_VALUE) {
+            throw new RuntimeException("Plane too big for a single byte[] (" + total + " bytes)");
+        }
+        byte[] out = new byte[(int) total];
+        int stride = width * bytesPerPx;
+        for (int y = 0; y < height; y += TILE_SIZE) {
+            int th = Math.min(TILE_SIZE, height - y);
+            for (int x = 0; x < width; x += TILE_SIZE) {
+                int tw = Math.min(TILE_SIZE, width - x);
+                byte[] tile = reader.openBytes(planeIndex, x, y, tw, th);
+                int tileStride = tw * bytesPerPx;
+                for (int ty = 0; ty < th; ty++) {
+                    int srcOff = ty * tileStride;
+                    int dstOff = (y + ty) * stride + x * bytesPerPx;
+                    System.arraycopy(tile, srcOff, out, dstOff, tileStride);
+                }
+            }
+        }
+        return out;
+    }
+
+    /** Convenience wrapper around {@link #readPlaneTiled} that converts the result to short[]. */
+    private short[] readPlaneTiledAsShorts(int planeIndex, int width, int height, boolean littleEndian)
+            throws Exception {
+        byte[] bytes = readPlaneTiled(planeIndex, width, height, 2);
+        return bytesToShorts(bytes, littleEndian);
     }
 
     /**
