@@ -200,6 +200,15 @@ public final class MifMergeCommand implements Runnable {
                 "Single level — fastest, no QuPath zoom support");
         pyramidChoice.setValue("Dyadic (1, 2, 4, 8, ...) — smooth QuPath zoom");
 
+        // Writer backend — libvips (native) is 5-10x faster than Bio-Formats for
+        // big files. Requires `vips` on PATH; falls back to Bio-Formats with a
+        // warning in the log if not found.
+        ChoiceBox<String> backendChoice = new ChoiceBox<>();
+        backendChoice.getItems().addAll(
+                "libvips (faster, requires `vips` on PATH)",
+                "Bio-Formats (fallback, slower, no install required)");
+        backendChoice.setValue("libvips (faster, requires `vips` on PATH)");
+
         GridPane grid = new GridPane();
         grid.setHgap(8);
         grid.setVgap(6);
@@ -217,6 +226,7 @@ public final class MifMergeCommand implements Runnable {
         grid.addRow(10, new Label("OME-TIFF tile size (px):"), tileSizeSpinner);
         grid.addRow(11, new Label("OME-TIFF write threads:"), writeThreadsSpinner);
         grid.addRow(12, new Label("OME-TIFF pyramid:"), pyramidChoice);
+        grid.addRow(13, new Label("OME-TIFF writer backend:"), backendChoice);
         GridPane.setHgrow(outRow, Priority.ALWAYS);
 
         // --- Progress + log ---
@@ -255,10 +265,10 @@ public final class MifMergeCommand implements Runnable {
         // Need enough height to show: file list (160) + file buttons + 10-row param grid
         // (~280) + progress + log (200) + buttons. Was 600 and the progress bar fell off
         // the bottom of the window on some setups.
-        Scene scene = new Scene(content, 720, 920);
+        Scene scene = new Scene(content, 740, 960);
         stage.setScene(scene);
-        stage.setMinWidth(660);
-        stage.setMinHeight(760);
+        stage.setMinWidth(680);
+        stage.setMinHeight(800);
 
         SimpleObjectProperty<Task<Void>> currentTask = new SimpleObjectProperty<>();
 
@@ -289,6 +299,7 @@ public final class MifMergeCommand implements Runnable {
                     tileSizeSpinner.getValue(),
                     writeThreadsSpinner.getValue(),
                     pyramidModeFromChoice(pyramidChoice.getValue()),
+                    backendFromChoice(backendChoice.getValue()),
                     log);
             // Bind the progress bar + status label to the Task's progress/message.
             // Task#updateProgress and #updateMessage (called from the worker thread)
@@ -355,6 +366,7 @@ public final class MifMergeCommand implements Runnable {
                                 OMEPyramidWriter.CompressionType compression, int tileSize,
                                 int nWriteThreads,
                                 OmeTiffMergeWriter.PyramidMode pyramidMode,
+                                OmeTiffMergeWriter.WriterBackend backend,
                                 TextArea log) {
         return new Task<>() {
             @Override
@@ -499,14 +511,16 @@ public final class MifMergeCommand implements Runnable {
                     updateProgress(0.70, 1);
                     updateMessage("Writing OME-TIFF (this is usually the slowest step)…");
                     appendLog(log, "  Writing OME-TIFF: " + outPath);
-                    appendLog(log, String.format("  Compression=%s, tileSize=%d, writeThreads=%d, pyramid=%s",
-                            compression, tileSize, nWriteThreads, pyramidMode));
+                    appendLog(log, String.format(
+                            "  Backend=%s, Compression=%s, tileSize=%d, writeThreads=%d, pyramid=%s",
+                            backend, compression, tileSize, nWriteThreads, pyramidMode));
                     OmeTiffMergeWriter.Options writeOpts = new OmeTiffMergeWriter.Options();
                     writeOpts.compression = compression;
                     writeOpts.tileSize = tileSize;
                     writeOpts.nWriteThreads = nWriteThreads;
                     writeOpts.pyramidMode = pyramidMode;
-                    OmeTiffMergeWriter.write(merged, outPath, writeOpts);
+                    writeOpts.backend = backend;
+                    OmeTiffMergeWriter.write(merged, outPath, writeOpts, msg -> appendLog(log, msg));
                     appendLog(log, "Done.");
 
                     // Hint the JVM to release tile cache + Bio-Formats buffers now
@@ -526,6 +540,13 @@ public final class MifMergeCommand implements Runnable {
                 }
             }
         };
+    }
+
+    /** Map the GUI dropdown label to an OmeTiffMergeWriter.WriterBackend. */
+    private static OmeTiffMergeWriter.WriterBackend backendFromChoice(String s) {
+        if (s == null) return OmeTiffMergeWriter.WriterBackend.LIBVIPS;
+        if (s.startsWith("Bio-Formats")) return OmeTiffMergeWriter.WriterBackend.BIO_FORMATS;
+        return OmeTiffMergeWriter.WriterBackend.LIBVIPS;
     }
 
     /** Map the GUI dropdown label to an OmeTiffMergeWriter.PyramidMode. */
