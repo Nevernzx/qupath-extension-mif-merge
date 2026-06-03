@@ -44,6 +44,7 @@ import qupath.ext.mifmerge.core.RegistrationOrchestrator;
 import qupath.ext.mifmerge.io.BioFormatsMifSource;
 import qupath.ext.mifmerge.merge.MergedServerFactory;
 import qupath.ext.mifmerge.merge.OmeTiffMergeWriter;
+import qupath.ext.mifmerge.merge.PyVipsWriter;
 import qupath.lib.images.writers.ome.OMEPyramidWriter;
 import qupath.lib.gui.QuPathGUI;
 import qupath.lib.images.servers.ImageServer;
@@ -201,14 +202,14 @@ public final class MifMergeCommand implements Runnable {
                 "Single level — fastest, no QuPath zoom support");
         pyramidChoice.setValue("Dyadic (1, 2, 4, 8, ...) — smooth QuPath zoom");
 
-        // Writer backend — libvips (native) is 5-10x faster than Bio-Formats for
-        // big files. Requires `vips` on PATH; falls back to Bio-Formats with a
-        // warning in the log if not found.
+        // Writer backend — pyvips is fastest (no intermediate file), libvips
+        // is the two-step version, Bio-Formats is the all-Java fallback.
         ChoiceBox<String> backendChoice = new ChoiceBox<>();
         backendChoice.getItems().addAll(
-                "libvips (faster, requires `vips` on PATH)",
-                "Bio-Formats (fallback, slower, no install required)");
-        backendChoice.setValue("libvips (faster, requires `vips` on PATH)");
+                "pyvips (fastest, requires Python+pyvips installed)",
+                "libvips (faster, requires `vips` on PATH, uses ~50 GB temp space)",
+                "Bio-Formats (fallback, slowest, no install required)");
+        backendChoice.setValue("pyvips (fastest, requires Python+pyvips installed)");
 
         GridPane grid = new GridPane();
         grid.setHgap(8);
@@ -534,6 +535,53 @@ public final class MifMergeCommand implements Runnable {
                 if (isCancelled()) return null;
 
                 // -------- Phase B: merge + write --------
+                // The PYVIPS backend bypasses QuPath ImageServers entirely —
+                // libvips reads source qptiffs natively. Branch out early.
+                OmeTiffMergeWriter.WriterBackend effectiveBackend = backend;
+                if (effectiveBackend == OmeTiffMergeWriter.WriterBackend.PYVIPS) {
+                    String pyvipsVer = PyVipsWriter.detectPythonPyVips();
+                    if (pyvipsVer == null) {
+                        appendLog(log, "  pyvips not found (need Python 3 with `pip install pyvips`); "
+                                + "falling back to libvips backend.");
+                        effectiveBackend = OmeTiffMergeWriter.WriterBackend.LIBVIPS;
+                    } else {
+                        appendLog(log, "  pyvips " + pyvipsVer + " detected — running native streaming merge");
+                    }
+                }
+                if (effectiveBackend == OmeTiffMergeWriter.WriterBackend.PYVIPS) {
+                    updateProgress(0.60, 1);
+                    updateMessage("Writing OME-TIFF via pyvips…");
+                    appendLog(log, "Phase B: pyvips merge + write (no QuPath ImageServers, no intermediate file)");
+                    appendLog(log, String.format(
+                            "  Backend=PYVIPS, Compression=%s, tileSize=%d, pyramid=%s",
+                            compression, tileSize, pyramidMode));
+
+                    List<MergedChannelLayout.ChannelEntry> layout =
+                            MergedChannelLayout.build(channelNamesPerSource, labels, dapiName, keepMovingDapi);
+                    appendLog(log, "  Merged layout has " + layout.size() + " channels"
+                            + (keepMovingDapi ? " (keeping all DAPI channels)" : " (moving DAPI dropped)"));
+
+                    PyVipsWriter.Recipe recipe = buildPyVipsRecipe(
+                            files, channelNamesPerSource, labels, dapiName, keepMovingDapi,
+                            movingAffines, outPath, compression, tileSize, pyramidMode);
+                    try {
+                        PyVipsWriter.run(recipe,
+                                msg -> appendLog(log, msg),
+                                proc -> processSink.set(proc));
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        throw new IOException("Interrupted while running pyvips", ie);
+                    }
+                    appendLog(log, "Done.");
+                    updateProgress(1.0, 1);
+                    updateMessage("Done.");
+                    return null;
+                }
+                // From here on, effectiveBackend is LIBVIPS or BIO_FORMATS — re-use the
+                // existing QuPath ImageServer route. (We can't reassign the
+                // 'backend' parameter from inside this lambda.)
+                final OmeTiffMergeWriter.WriterBackend backendForWrite = effectiveBackend;
+
                 updateProgress(0.60, 1);
                 updateMessage("Opening QuPath ImageServers…");
                 appendLog(log, "Phase B: merge + write OME-TIFF");
@@ -569,16 +617,16 @@ public final class MifMergeCommand implements Runnable {
                     appendLog(log, "  Writing OME-TIFF: " + outPath);
                     appendLog(log, String.format(
                             "  Backend=%s, Compression=%s, tileSize=%d, writeThreads=%d, pyramid=%s",
-                            backend, compression, tileSize, nWriteThreads, pyramidMode));
+                            backendForWrite, compression, tileSize, nWriteThreads, pyramidMode));
                     OmeTiffMergeWriter.Options writeOpts = new OmeTiffMergeWriter.Options();
                     writeOpts.compression = compression;
                     writeOpts.tileSize = tileSize;
                     writeOpts.nWriteThreads = nWriteThreads;
                     writeOpts.pyramidMode = pyramidMode;
-                    writeOpts.backend = backend;
+                    writeOpts.backend = backendForWrite;
                     // Compute the intermediate path now (same logic libvips backend uses)
                     // so the cancel handler knows what file to delete.
-                    if (backend == OmeTiffMergeWriter.WriterBackend.LIBVIPS) {
+                    if (backendForWrite == OmeTiffMergeWriter.WriterBackend.LIBVIPS) {
                         Path interm = computeIntermediatePath(outPath);
                         intermediatePathSink.set(interm);
                     }
@@ -674,9 +722,86 @@ public final class MifMergeCommand implements Runnable {
 
     /** Map the GUI dropdown label to an OmeTiffMergeWriter.WriterBackend. */
     private static OmeTiffMergeWriter.WriterBackend backendFromChoice(String s) {
-        if (s == null) return OmeTiffMergeWriter.WriterBackend.LIBVIPS;
+        if (s == null) return OmeTiffMergeWriter.WriterBackend.PYVIPS;
         if (s.startsWith("Bio-Formats")) return OmeTiffMergeWriter.WriterBackend.BIO_FORMATS;
-        return OmeTiffMergeWriter.WriterBackend.LIBVIPS;
+        if (s.startsWith("libvips")) return OmeTiffMergeWriter.WriterBackend.LIBVIPS;
+        return OmeTiffMergeWriter.WriterBackend.PYVIPS;
+    }
+
+    /**
+     * Convert the per-source channel name lists + affines into a
+     * {@link PyVipsWriter.Recipe} the Python script can read directly.
+     *
+     * <p>Channel page index assumption: for Vectra Polaris qptiff full-resolution
+     * channels live in TIFF pages 0..nChannels-1 (one channel per page,
+     * channels-first then pyramid). This holds for every Vectra qptiff we've
+     * tested. If a non-Vectra qptiff comes in with a different layout this
+     * needs revisiting.
+     */
+    private static PyVipsWriter.Recipe buildPyVipsRecipe(
+            List<File> files,
+            List<List<String>> channelNamesPerSource,
+            List<String> labels,
+            String dapiNameMatch,
+            boolean keepMovingDapi,
+            List<AffineTransform> movingAffines,
+            String outputPath,
+            OMEPyramidWriter.CompressionType compression,
+            int tileSize,
+            OmeTiffMergeWriter.PyramidMode pyramidMode) {
+
+        String needle = dapiNameMatch == null ? "dapi" : dapiNameMatch.toLowerCase();
+
+        // Build fixed source spec
+        List<String> fixedChans = channelNamesPerSource.get(0);
+        String fixedLabel = labels.get(0);
+        List<PyVipsWriter.ChannelSpec> fixedChannelSpecs = new ArrayList<>();
+        for (int c = 0; c < fixedChans.size(); c++) {
+            String name = fixedChans.get(c);
+            boolean isDapi = name != null && name.toLowerCase().contains(needle);
+            // Fixed always keeps everything
+            String outName = (fixedLabel != null && !fixedLabel.isEmpty())
+                    ? fixedLabel + " | " + (name != null ? name : "ch" + c)
+                    : (name != null ? name : "ch" + c);
+            fixedChannelSpecs.add(new PyVipsWriter.ChannelSpec(
+                    c, name != null ? name : "ch" + c, isDapi, true, outName));
+        }
+        PyVipsWriter.SourceSpec fixedSpec = new PyVipsWriter.SourceSpec(
+                files.get(0).getAbsolutePath(), fixedChannelSpecs, null);
+
+        // Build moving source specs
+        List<PyVipsWriter.SourceSpec> movingSpecs = new ArrayList<>();
+        for (int srcIdx = 1; srcIdx < channelNamesPerSource.size(); srcIdx++) {
+            List<String> chans = channelNamesPerSource.get(srcIdx);
+            String label = labels.get(srcIdx);
+            AffineTransform aff = movingAffines.get(srcIdx - 1);
+            double[] flat = new double[6];
+            aff.getMatrix(flat);   // [m00, m10, m01, m11, m02, m12]
+            double[][] matrix = new double[][] {
+                    { flat[0], flat[2], flat[4] },
+                    { flat[1], flat[3], flat[5] },
+                    { 0.0,      0.0,     1.0   }
+            };
+            List<PyVipsWriter.ChannelSpec> chanSpecs = new ArrayList<>();
+            for (int c = 0; c < chans.size(); c++) {
+                String name = chans.get(c);
+                boolean isDapi = name != null && name.toLowerCase().contains(needle);
+                boolean include = !isDapi || keepMovingDapi;
+                String outName = include
+                        ? (label != null && !label.isEmpty()
+                            ? label + " | " + (name != null ? name : "ch" + c)
+                            : (name != null ? name : "ch" + c))
+                        : null;
+                chanSpecs.add(new PyVipsWriter.ChannelSpec(
+                        c, name != null ? name : "ch" + c, isDapi, include, outName));
+            }
+            movingSpecs.add(new PyVipsWriter.SourceSpec(
+                    files.get(srcIdx).getAbsolutePath(), chanSpecs, matrix));
+        }
+
+        return new PyVipsWriter.Recipe(
+                fixedSpec, movingSpecs, outputPath,
+                compression, tileSize, pyramidMode);
     }
 
     /** Map the GUI dropdown label to an OmeTiffMergeWriter.PyramidMode. */

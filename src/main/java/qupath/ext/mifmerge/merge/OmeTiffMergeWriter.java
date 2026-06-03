@@ -55,7 +55,19 @@ public final class OmeTiffMergeWriter {
          * Use QuPath's {@link OMEPyramidWriter} for everything. No external
          * dependencies. Slower for big files but always works.
          */
-        BIO_FORMATS
+        BIO_FORMATS,
+        /**
+         * Use a pyvips Python sidecar that reads source qptiffs directly via
+         * libvips, applies the affine warp, bandjoins channels, and writes the
+         * pyramidal OME-TIFF — all in one streaming native pipeline, no
+         * intermediate file on disk. Fastest available; requires Python 3 with
+         * the {@code pyvips} package and libvips on PATH.
+         *
+         * <p>Note: this backend doesn't go through {@code ImageServer} chains —
+         * see {@link PyVipsWriter}. The Java side wires the data path
+         * differently when this is selected.
+         */
+        PYVIPS
     }
 
     public static final class Options {
