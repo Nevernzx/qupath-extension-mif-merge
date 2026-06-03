@@ -161,6 +161,8 @@ public final class MifMergeCommand implements Runnable {
         HBox.setHgrow(outPathField, Priority.ALWAYS);
 
         TextField dapiField = new TextField("DAPI");
+        CheckBox keepMovingDapi = new CheckBox("Keep moving images' DAPI channels too (default: drop them to avoid duplicates)");
+        keepMovingDapi.setSelected(false);
         Spinner<Integer> stage1Long = new Spinner<>(1000, 20000, 4000, 500);
         Spinner<Integer> stage2Long = new Spinner<>(1000, 50000, 14000, 1000);
         // Cap on SIFT keypoints per image. Memory scales ~linearly with this.
@@ -204,16 +206,17 @@ public final class MifMergeCommand implements Runnable {
         grid.setPadding(new Insets(8, 0, 8, 0));
         grid.addRow(0, new Label("Output:"), outRow);
         grid.addRow(1, new Label("DAPI channel match:"), dapiField);
-        grid.addRow(2, new Label("Stage 1 long side (px):"), stage1Long);
-        grid.addRow(3, new Label("Stage 2 long side (px):"), stage2Long);
-        grid.addRow(4, new Label("SIFT keypoints per image:"), nFeaturesSpinner);
-        grid.add(stage3Enable, 0, 5, 2, 1);
-        grid.addRow(6, new Label("  Stage 3 windows:"), stage3NumWindows);
-        grid.addRow(7, new Label("  Stage 3 window size (px):"), stage3WindowSize);
-        grid.addRow(8, new Label("OME-TIFF compression:"), compressionChoice);
-        grid.addRow(9, new Label("OME-TIFF tile size (px):"), tileSizeSpinner);
-        grid.addRow(10, new Label("OME-TIFF write threads:"), writeThreadsSpinner);
-        grid.addRow(11, new Label("OME-TIFF pyramid:"), pyramidChoice);
+        grid.add(keepMovingDapi, 0, 2, 2, 1);
+        grid.addRow(3, new Label("Stage 1 long side (px):"), stage1Long);
+        grid.addRow(4, new Label("Stage 2 long side (px):"), stage2Long);
+        grid.addRow(5, new Label("SIFT keypoints per image:"), nFeaturesSpinner);
+        grid.add(stage3Enable, 0, 6, 2, 1);
+        grid.addRow(7, new Label("  Stage 3 windows:"), stage3NumWindows);
+        grid.addRow(8, new Label("  Stage 3 window size (px):"), stage3WindowSize);
+        grid.addRow(9, new Label("OME-TIFF compression:"), compressionChoice);
+        grid.addRow(10, new Label("OME-TIFF tile size (px):"), tileSizeSpinner);
+        grid.addRow(11, new Label("OME-TIFF write threads:"), writeThreadsSpinner);
+        grid.addRow(12, new Label("OME-TIFF pyramid:"), pyramidChoice);
         GridPane.setHgrow(outRow, Priority.ALWAYS);
 
         // --- Progress + log ---
@@ -276,6 +279,7 @@ public final class MifMergeCommand implements Runnable {
             Task<Void> task = makeTask(
                     new ArrayList<>(files), outPath,
                     dapiField.getText(),
+                    keepMovingDapi.isSelected(),
                     stage1Long.getValue(), stage2Long.getValue(),
                     nFeaturesSpinner.getValue(),
                     stage3Enable.isSelected(),
@@ -344,7 +348,8 @@ public final class MifMergeCommand implements Runnable {
     }
 
     private Task<Void> makeTask(List<File> files, String outPath,
-                                String dapiName, int stage1Long, int stage2Long,
+                                String dapiName, boolean keepMovingDapi,
+                                int stage1Long, int stage2Long,
                                 int nFeatures,
                                 boolean enableStage3, int stage3NumWindows, int stage3WindowSize,
                                 OMEPyramidWriter.CompressionType compression, int tileSize,
@@ -484,8 +489,9 @@ public final class MifMergeCommand implements Runnable {
                     updateProgress(0.65, 1);
                     updateMessage("Building merged virtual server…");
                     List<MergedChannelLayout.ChannelEntry> layout =
-                            MergedChannelLayout.build(channelNamesPerSource, labels, dapiName);
-                    appendLog(log, "  Merged layout has " + layout.size() + " channels");
+                            MergedChannelLayout.build(channelNamesPerSource, labels, dapiName, keepMovingDapi);
+                    appendLog(log, "  Merged layout has " + layout.size() + " channels"
+                            + (keepMovingDapi ? " (keeping all DAPI channels)" : " (moving DAPI dropped)"));
 
                     ImageServer<BufferedImage> merged = MergedServerFactory.build(
                             qp.get(0), moving, layout);

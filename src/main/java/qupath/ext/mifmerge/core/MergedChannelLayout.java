@@ -50,6 +50,19 @@ public final class MergedChannelLayout {
     }
 
     /**
+     * Build the layout, dropping moving DAPI channels (the default behaviour
+     * — two DAPI scans of the same tissue are redundant after registration).
+     * Equivalent to {@link #build(List, List, String, boolean)} with
+     * {@code keepMovingDapi = false}.
+     */
+    public static List<ChannelEntry> build(
+            List<List<String>> sourceChannelNames,
+            List<String> sourceLabels,
+            String dapiNameMatch) {
+        return build(sourceChannelNames, sourceLabels, dapiNameMatch, false);
+    }
+
+    /**
      * Build the layout. The first element of {@code sourceChannelNames} is
      * the fixed reference; subsequent elements are moving sources.
      *
@@ -57,11 +70,16 @@ public final class MergedChannelLayout {
      * @param sourceLabels optional short tags used as prefix in merged names
      *                     (e.g. file stem). If null/empty, no prefix added.
      * @param dapiNameMatch substring (case-insensitive) used to identify DAPI
+     * @param keepMovingDapi if {@code true}, moving sources' DAPI channels are
+     *                       kept in the output (useful when you want to inspect
+     *                       both DAPI scans, e.g. for QC). If {@code false},
+     *                       only the fixed DAPI is kept.
      */
     public static List<ChannelEntry> build(
             List<List<String>> sourceChannelNames,
             List<String> sourceLabels,
-            String dapiNameMatch) {
+            String dapiNameMatch,
+            boolean keepMovingDapi) {
         if (sourceChannelNames.isEmpty()) {
             throw new IllegalArgumentException("At least one source is required");
         }
@@ -82,7 +100,7 @@ public final class MergedChannelLayout {
             for (int ch = 0; ch < channels.size(); ch++) {
                 String name = channels.get(ch);
                 boolean isDapi = name != null && name.toLowerCase().contains(needleLower);
-                if (!isFixed && isDapi) {
+                if (!isFixed && isDapi && !keepMovingDapi) {
                     continue;   // drop moving DAPI to avoid duplicates
                 }
                 String merged;
