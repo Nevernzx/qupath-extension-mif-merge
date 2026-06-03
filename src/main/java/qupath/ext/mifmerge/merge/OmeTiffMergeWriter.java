@@ -99,16 +99,26 @@ public final class OmeTiffMergeWriter {
 
     public static void write(ImageServer<BufferedImage> server, String outputPath, Options opts)
             throws IOException {
-        write(server, outputPath, opts, null);
+        write(server, outputPath, opts, null, null);
+    }
+
+    public static void write(ImageServer<BufferedImage> server, String outputPath, Options opts,
+                             java.util.function.Consumer<String> progressLog)
+            throws IOException {
+        write(server, outputPath, opts, progressLog, null);
     }
 
     /**
-     * @param progressLog optional callback (typically the GUI text area) used
-     *                    to surface intermediate progress messages, especially
-     *                    when the libvips backend is in use.
+     * @param progressLog       optional callback (typically the GUI text area) used
+     *                          to surface intermediate progress messages
+     * @param processRegistrar  optional callback called once with the live
+     *                          {@link Process} of any subprocess (e.g. vips) we
+     *                          spawn; lets the caller {@code destroy()} it on
+     *                          user cancel
      */
     public static void write(ImageServer<BufferedImage> server, String outputPath, Options opts,
-                             java.util.function.Consumer<String> progressLog)
+                             java.util.function.Consumer<String> progressLog,
+                             java.util.function.Consumer<Process> processRegistrar)
             throws IOException {
         if (opts == null) opts = new Options();
         java.util.function.Consumer<String> log = progressLog != null ? progressLog : s -> {};
@@ -128,7 +138,7 @@ public final class OmeTiffMergeWriter {
         }
 
         if (backend == WriterBackend.LIBVIPS) {
-            writeWithLibVips(server, outputPath, opts, log);
+            writeWithLibVips(server, outputPath, opts, log, processRegistrar);
         } else {
             writeWithBioFormats(server, outputPath, opts);
         }
@@ -187,7 +197,8 @@ public final class OmeTiffMergeWriter {
      */
     private static void writeWithLibVips(ImageServer<BufferedImage> server, String outputPath,
                                          Options opts,
-                                         java.util.function.Consumer<String> log) throws IOException {
+                                         java.util.function.Consumer<String> log,
+                                         java.util.function.Consumer<Process> processRegistrar) throws IOException {
         Path output = Path.of(outputPath).toAbsolutePath();
         Path intermediateDir = opts.libvipsIntermediateDir != null
                 ? Path.of(opts.libvipsIntermediateDir)
@@ -227,7 +238,7 @@ public final class OmeTiffMergeWriter {
         log.accept("  libvips step 2/2: vips tiffsave (compression + pyramid)…");
         long t1 = System.currentTimeMillis();
         try {
-            LibVipsWriter.runVipsTiffSave(intermediate, output, opts, log);
+            LibVipsWriter.runVipsTiffSave(intermediate, output, opts, log, processRegistrar);
         } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
             throw new IOException("Interrupted while waiting for vips", ie);

@@ -37,6 +37,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Locale;
+import java.util.concurrent.atomic.AtomicReference;
 import qupath.ext.mifmerge.core.MergedChannelLayout;
 import qupath.ext.mifmerge.core.MifImageSource;
 import qupath.ext.mifmerge.core.RegistrationOrchestrator;
@@ -240,10 +241,12 @@ public final class MifMergeCommand implements Runnable {
         HBox progressRow = new HBox(8, statusLabel);
         progressRow.setAlignment(Pos.CENTER_LEFT);
 
-        // --- Bottom row: Run + Close ---
+        // --- Bottom row: Run + Cancel + Close ---
         Button runBtn = new Button("Run merge");
+        Button cancelBtn = new Button("Cancel & clean up");
+        cancelBtn.setDisable(true);   // only enabled while a task is running
         Button closeBtn = new Button("Close");
-        HBox bottomRow = new HBox(8, runBtn, closeBtn);
+        HBox bottomRow = new HBox(8, runBtn, cancelBtn, closeBtn);
 
         VBox content = new VBox(8,
                 new Label("Select qptiffs (first is the fixed reference):"),
@@ -271,6 +274,13 @@ public final class MifMergeCommand implements Runnable {
         stage.setMinHeight(800);
 
         SimpleObjectProperty<Task<Void>> currentTask = new SimpleObjectProperty<>();
+        // Shared between Cancel button and the running task so the cancel can
+        // (a) kill the live libvips subprocess if any,
+        // (b) know which files to delete when the task actually stops.
+        AtomicReference<Process> currentProcess = new AtomicReference<>();
+        AtomicReference<String> currentOutputPath = new AtomicReference<>();
+        AtomicReference<Path> currentIntermediatePath = new AtomicReference<>();
+        AtomicReference<Boolean> userCancelled = new AtomicReference<>(false);
 
         runBtn.setOnAction(evt -> {
             if (files.size() < 2) {
@@ -283,7 +293,12 @@ public final class MifMergeCommand implements Runnable {
                 return;
             }
             runBtn.setDisable(true);
+            cancelBtn.setDisable(false);
             log.clear();
+            currentProcess.set(null);
+            currentOutputPath.set(outPath);
+            currentIntermediatePath.set(null);
+            userCancelled.set(false);
             long taskStart = System.currentTimeMillis();
 
             Task<Void> task = makeTask(
@@ -300,7 +315,8 @@ public final class MifMergeCommand implements Runnable {
                     writeThreadsSpinner.getValue(),
                     pyramidModeFromChoice(pyramidChoice.getValue()),
                     backendFromChoice(backendChoice.getValue()),
-                    log);
+                    log,
+                    currentProcess, currentIntermediatePath);
             // Bind the progress bar + status label to the Task's progress/message.
             // Task#updateProgress and #updateMessage (called from the worker thread)
             // are thread-safe and update these properties on the FX thread.
@@ -308,7 +324,6 @@ public final class MifMergeCommand implements Runnable {
             statusLabel.textProperty().bind(task.messageProperty());
 
             task.setOnSucceeded(e -> Platform.runLater(() -> {
-                // Unbind so we can override
                 progress.progressProperty().unbind();
                 statusLabel.textProperty().unbind();
                 progress.setProgress(1.0);
@@ -316,7 +331,7 @@ public final class MifMergeCommand implements Runnable {
                 statusLabel.setText(String.format(" ✓ Merge complete in %ds", elapsed));
                 statusLabel.setStyle("-fx-font-weight: bold; -fx-text-fill: #2a8000;");
                 runBtn.setDisable(false);
-                // Audible cue
+                cancelBtn.setDisable(true);
                 try { Toolkit.getDefaultToolkit().beep(); } catch (Throwable ignored) {}
                 showSuccessAlert(stage, outPath, elapsed);
             }));
@@ -324,11 +339,16 @@ public final class MifMergeCommand implements Runnable {
                 progress.progressProperty().unbind();
                 statusLabel.textProperty().unbind();
                 progress.setProgress(0);
-                statusLabel.setText(" ✗ Failed");
+                statusLabel.setText(" ✗ Failed (cleaning up files…)");
                 statusLabel.setStyle("-fx-font-weight: bold; -fx-text-fill: #c00000;");
                 runBtn.setDisable(false);
+                cancelBtn.setDisable(true);
                 Throwable t = task.getException();
                 logger.error("MIF Merge failed", t);
+                // Cleanup on a daemon thread so we don't freeze the FX thread
+                // while Files.deleteIfExists retries on Windows.
+                runCleanupAsync(currentOutputPath.get(), currentIntermediatePath.get(), log,
+                        () -> statusLabel.setText(" ✗ Failed"));
                 try { Toolkit.getDefaultToolkit().beep(); } catch (Throwable ignored) {}
                 showError(stage, "Failed: " + (t == null ? "(no exception)" : t.getMessage()));
             }));
@@ -336,9 +356,12 @@ public final class MifMergeCommand implements Runnable {
                 progress.progressProperty().unbind();
                 statusLabel.textProperty().unbind();
                 progress.setProgress(0);
-                statusLabel.setText(" — Cancelled");
+                statusLabel.setText(" — Cancelled (cleaning up files…)");
                 statusLabel.setStyle("-fx-font-weight: bold;");
                 runBtn.setDisable(false);
+                cancelBtn.setDisable(true);
+                runCleanupAsync(currentOutputPath.get(), currentIntermediatePath.get(), log,
+                        () -> statusLabel.setText(" — Cancelled"));
             }));
             currentTask.set(task);
             Thread thr = new Thread(task, "mif-merge-task");
@@ -346,12 +369,43 @@ public final class MifMergeCommand implements Runnable {
             thr.start();
         });
 
+        cancelBtn.setOnAction(evt -> {
+            Task<Void> t = currentTask.get();
+            if (t == null || !t.isRunning()) {
+                return;
+            }
+            appendLog(log, "── User cancel requested ──");
+            userCancelled.set(true);
+            // 1. Kill the libvips subprocess if any. This unlocks files on
+            //    Windows so we can delete them.
+            Process p = currentProcess.getAndSet(null);
+            if (p != null && p.isAlive()) {
+                appendLog(log, "  killing vips subprocess (pid=" + p.pid() + ")");
+                p.destroyForcibly();
+            }
+            // 2. Interrupt the JavaFX Task. Inside makeTask we check
+            //    isCancelled() between steps; the Bio-Formats writer doesn't
+            //    respond to interruption itself but the thread will stop at
+            //    its next yield point.
+            t.cancel(true);
+            cancelBtn.setDisable(true);
+            statusLabel.textProperty().unbind();
+            statusLabel.setText(" — Cancelling, please wait…");
+            statusLabel.setStyle("-fx-font-weight: bold; -fx-text-fill: #a05000;");
+        });
+
         closeBtn.setOnAction(evt -> stage.close());
 
         stage.setOnCloseRequest(evt -> {
             Task<Void> t = currentTask.get();
             if (t != null && t.isRunning()) {
+                // Same code path as the Cancel button
+                Process p = currentProcess.getAndSet(null);
+                if (p != null && p.isAlive()) {
+                    p.destroyForcibly();
+                }
                 t.cancel(true);
+                // setOnCancelled handler will trigger async cleanup
             }
         });
 
@@ -367,7 +421,9 @@ public final class MifMergeCommand implements Runnable {
                                 int nWriteThreads,
                                 OmeTiffMergeWriter.PyramidMode pyramidMode,
                                 OmeTiffMergeWriter.WriterBackend backend,
-                                TextArea log) {
+                                TextArea log,
+                                AtomicReference<Process> processSink,
+                                AtomicReference<Path> intermediatePathSink) {
         return new Task<>() {
             @Override
             protected Void call() throws Exception {
@@ -520,7 +576,15 @@ public final class MifMergeCommand implements Runnable {
                     writeOpts.nWriteThreads = nWriteThreads;
                     writeOpts.pyramidMode = pyramidMode;
                     writeOpts.backend = backend;
-                    OmeTiffMergeWriter.write(merged, outPath, writeOpts, msg -> appendLog(log, msg));
+                    // Compute the intermediate path now (same logic libvips backend uses)
+                    // so the cancel handler knows what file to delete.
+                    if (backend == OmeTiffMergeWriter.WriterBackend.LIBVIPS) {
+                        Path interm = computeIntermediatePath(outPath);
+                        intermediatePathSink.set(interm);
+                    }
+                    OmeTiffMergeWriter.write(merged, outPath, writeOpts,
+                            msg -> appendLog(log, msg),
+                            proc -> processSink.set(proc));
                     appendLog(log, "Done.");
 
                     // Hint the JVM to release tile cache + Bio-Formats buffers now
@@ -540,6 +604,72 @@ public final class MifMergeCommand implements Runnable {
                 }
             }
         };
+    }
+
+    /** Run cleanup on a daemon thread so the FX thread isn't blocked by deletion retries. */
+    private static void runCleanupAsync(String outputPath, Path intermediate, TextArea log,
+                                        Runnable onDone) {
+        Thread t = new Thread(() -> {
+            cleanupCancelledArtifacts(outputPath, intermediate, log);
+            if (onDone != null) Platform.runLater(onDone);
+        }, "mif-merge-cleanup");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    /**
+     * Best-effort delete of files we know we were writing when a cancel /
+     * failure hit. On Windows a file may still be locked by a not-yet-terminated
+     * writer thread; we retry a few times with backoff before giving up.
+     */
+    private static void cleanupCancelledArtifacts(String outputPath, Path intermediate, TextArea log) {
+        if (outputPath != null) {
+            tryDelete(Path.of(outputPath), log);
+        }
+        if (intermediate != null) {
+            tryDelete(intermediate, log);
+        }
+    }
+
+    /**
+     * Mirror the logic in {@link OmeTiffMergeWriter#writeWithLibVips} for naming
+     * the intermediate. Has to stay in sync with that method.
+     */
+    private static Path computeIntermediatePath(String outputPath) {
+        Path output = Path.of(outputPath).toAbsolutePath();
+        Path parent = output.getParent();
+        if (parent == null) parent = Path.of(".");
+        String stem = output.getFileName().toString();
+        String lower = stem.toLowerCase();
+        if (lower.endsWith(".ome.tif")) stem = stem.substring(0, stem.length() - 8);
+        else if (lower.endsWith(".ome.tiff")) stem = stem.substring(0, stem.length() - 9);
+        else if (lower.endsWith(".tif")) stem = stem.substring(0, stem.length() - 4);
+        else if (lower.endsWith(".tiff")) stem = stem.substring(0, stem.length() - 5);
+        return parent.resolve(stem + ".intermediate.tif");
+    }
+
+    private static void tryDelete(Path path, TextArea log) {
+        if (path == null || !path.toFile().exists()) return;
+        long sizeMb = path.toFile().length() / 1024 / 1024;
+        for (int attempt = 1; attempt <= 5; attempt++) {
+            try {
+                Files.deleteIfExists(path);
+                appendLog(log, String.format("  deleted %s (%d MB)", path.getFileName(), sizeMb));
+                return;
+            } catch (IOException e) {
+                if (attempt == 5) {
+                    appendLog(log, String.format(
+                            "  warning: could not delete %s after %d attempts (%s). "
+                                    + "You may need to delete it manually.",
+                            path, attempt, e.getMessage()));
+                } else {
+                    try { Thread.sleep(500L * attempt); } catch (InterruptedException ignored) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                }
+            }
+        }
     }
 
     /** Map the GUI dropdown label to an OmeTiffMergeWriter.WriterBackend. */

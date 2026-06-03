@@ -82,10 +82,15 @@ public final class LibVipsWriter {
      *                         we map {@code compression}, {@code tileSize},
      *                         {@code pyramidMode} onto the corresponding vips flags
      * @param logSink          optional callback receiving every line vips emits
+     * @param processRegistrar optional callback called once with the live
+     *                         {@link Process} as soon as vips starts; allows
+     *                         the caller to {@code destroy()} it on cancel
      */
     public static void runVipsTiffSave(Path intermediatePath, Path outputPath,
                                        OmeTiffMergeWriter.Options opts,
-                                       Consumer<String> logSink) throws IOException, InterruptedException {
+                                       Consumer<String> logSink,
+                                       Consumer<Process> processRegistrar)
+            throws IOException, InterruptedException {
         if (!Files.exists(intermediatePath)) {
             throw new IOException("Intermediate file does not exist: " + intermediatePath);
         }
@@ -135,6 +140,9 @@ public final class LibVipsWriter {
         pb.redirectErrorStream(true);
         long t0 = System.currentTimeMillis();
         Process p = pb.start();
+        if (processRegistrar != null) {
+            processRegistrar.accept(p);
+        }
 
         // Stream vips output to the log sink
         try (BufferedReader r = new BufferedReader(new InputStreamReader(p.getInputStream()))) {
@@ -147,6 +155,10 @@ public final class LibVipsWriter {
         int exit = p.waitFor();
         long elapsed = (System.currentTimeMillis() - t0) / 1000;
         if (exit != 0) {
+            // 137 = killed, 143 = SIGTERM, others = real error
+            if (exit == 137 || exit == 143 || Thread.currentThread().isInterrupted()) {
+                throw new InterruptedException("vips was killed (exit " + exit + ")");
+            }
             throw new IOException("vips tiffsave failed with exit code " + exit
                     + " after " + elapsed + "s");
         }
