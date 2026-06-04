@@ -33,6 +33,39 @@ def err(msg: str) -> None:
     print(f"MERGE-ERR: {msg}", file=sys.stderr, flush=True)
 
 
+def _supports_compression(pyvips_mod, compression: str) -> bool:
+    """Probe whether libvips' tiffsave supports a given compression by trying a 1x1 save.
+       Some Windows builds of libvips (notably pyvips-binary) ship without JPEG2000 or WebP."""
+    try:
+        tiny = pyvips_mod.Image.black(1, 1)
+        kwargs = {"compression": compression}
+        if compression in ("jpeg", "jp2k", "webp"):
+            kwargs["Q"] = 85
+        tiny.tiffsave_buffer(**kwargs)
+        return True
+    except Exception:
+        return False
+
+
+def pick_fallback_compression(pyvips_mod, requested: str, vips_format: str):
+    """Return (effective_compression, note). 'note' is empty if no fallback was needed."""
+    LOSSY = {"jp2k", "webp"}
+    if requested not in LOSSY:
+        # The lossless compressions (lzw, deflate, none, zstd) are universally
+        # supported. Don't probe them.
+        return requested, ""
+    if _supports_compression(pyvips_mod, requested):
+        return requested, ""
+    # Requested a lossy codec that's not in this libvips build → pick a fallback.
+    # For 8-bit (uchar) data, JPEG works fine and is small/fast.
+    # For 16-bit (ushort) data, fall back to LZW (lossless).
+    if vips_format == "uchar" and _supports_compression(pyvips_mod, "jpeg"):
+        return "jpeg", (f"libvips was built without '{requested}' support; "
+                        f"using JPEG instead (data is 8-bit, visually equivalent)")
+    return "lzw", (f"libvips was built without '{requested}' support and data is "
+                   f"{vips_format} (not 8-bit); using LZW (lossless, ~2-3x larger file)")
+
+
 def invert_affine(m: list[list[float]]) -> tuple[float, float, float, float, float, float]:
     """Return (a, b, c, d, odx, ody) for vips affine such that
        output(x, y) = input(a*x + b*y + odx, c*x + d*y + ody)
@@ -67,7 +100,10 @@ def run(recipe: dict) -> int:
         err("Install with: pip install pyvips")
         return 2
 
-    libvips_ver = pyvips.version(0)
+    try:
+        libvips_ver = f"{pyvips.version(0)}.{pyvips.version(1)}.{pyvips.version(2)}"
+    except Exception:
+        libvips_ver = "?"
     emit(f"pyvips {pyvips.__version__} | libvips {libvips_ver}")
 
     fixed_cfg = recipe["fixed"]
@@ -129,15 +165,22 @@ def run(recipe: dict) -> int:
         merged = images[0].bandjoin(images[1:])
     emit(f"bandjoin complete: bands={merged.bands} format={merged.format}")
 
+    # -------- compression capability check + fallback --------
+    requested_compression = out_cfg["compression"]
+    effective_compression, fallback_note = pick_fallback_compression(
+        pyvips, requested_compression, merged.format)
+    if fallback_note:
+        emit(f"NOTE: {fallback_note}")
+
     # -------- tiffsave --------
     save_kwargs: dict = {
         "tile": True,
         "tile_width": out_cfg["tile_size"],
         "tile_height": out_cfg["tile_size"],
         "bigtiff": True,
-        "compression": out_cfg["compression"],
+        "compression": effective_compression,
     }
-    if out_cfg["compression"] in ("jpeg", "jp2k", "webp"):
+    if effective_compression in ("jpeg", "jp2k", "webp"):
         save_kwargs["Q"] = int(out_cfg.get("quality", 85))
     if out_cfg["pyramid"] != "single":
         save_kwargs["pyramid"] = True
@@ -146,7 +189,7 @@ def run(recipe: dict) -> int:
     # Set 'subifd' so pyramid pages are sub-IFDs (cleaner for OME-TIFF readers).
     save_kwargs["subifd"] = True
 
-    emit(f"writing {out_cfg['path']} (compression={out_cfg['compression']}, pyramid={out_cfg['pyramid']}, tile={out_cfg['tile_size']})")
+    emit(f"writing {out_cfg['path']} (compression={effective_compression}, pyramid={out_cfg['pyramid']}, tile={out_cfg['tile_size']})")
     t0 = time.time()
     merged.tiffsave(out_cfg["path"], **save_kwargs)
     elapsed = time.time() - t0
