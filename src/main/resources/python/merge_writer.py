@@ -157,18 +157,27 @@ def run(recipe: dict) -> int:
 
     emit(f"merged layout has {len(all_channels)} channels, output canvas {out_w}x{out_h}")
 
-    # -------- Bandjoin --------
+    # -------- Stack channels as TIFF pages (NOT bands) --------
+    # TIFF + JPEG only supports samples-per-pixel in {1, 3, 4}. With N>4
+    # channels we can't use bandjoin (which would produce an N-sample image).
+    # Canonical OME-TIFF multi-channel layout is one channel per IFD/page,
+    # which we get by arrayjoin (vertical stack) + page_height. Each page
+    # ends up as a single-band image, which JPEG can compress just fine.
     images = [img for _, img in all_channels]
     if len(images) == 1:
-        merged = images[0]
+        combined = images[0]
+        page_height = out_h
     else:
-        merged = images[0].bandjoin(images[1:])
-    emit(f"bandjoin complete: bands={merged.bands} format={merged.format}")
+        combined = pyvips.Image.arrayjoin(images, across=1)
+        page_height = out_h
+    emit(f"arrayjoin complete: total {combined.width}x{combined.height} "
+         f"(= {len(images)} channels x page_height={page_height}), "
+         f"per-page bands={images[0].bands} format={combined.format}")
 
     # -------- compression capability check + fallback --------
     requested_compression = out_cfg["compression"]
     effective_compression, fallback_note = pick_fallback_compression(
-        pyvips, requested_compression, merged.format)
+        pyvips, requested_compression, combined.format)
     if fallback_note:
         emit(f"NOTE: {fallback_note}")
 
@@ -179,21 +188,34 @@ def run(recipe: dict) -> int:
         "tile_height": out_cfg["tile_size"],
         "bigtiff": True,
         "compression": effective_compression,
+        # page_height splits the tall arrayjoin image into N pages
+        "page_height": page_height,
     }
     if effective_compression in ("jpeg", "jp2k", "webp"):
         save_kwargs["Q"] = int(out_cfg.get("quality", 85))
     if out_cfg["pyramid"] != "single":
         save_kwargs["pyramid"] = True
-        # vips tiffsave does dyadic by default; sparse is not directly supported
-    # Multi-channel uint16 → save as multi-page TIFF with OME-XML
-    # Set 'subifd' so pyramid pages are sub-IFDs (cleaner for OME-TIFF readers).
-    save_kwargs["subifd"] = True
+        # Put pyramid levels as SubIFDs of the main IFDs — cleaner for OME-TIFF
+        # readers (Bio-Formats / QuPath / ImageJ) than interleaving as more pages.
+        save_kwargs["subifd"] = True
 
-    emit(f"writing {out_cfg['path']} (compression={effective_compression}, pyramid={out_cfg['pyramid']}, tile={out_cfg['tile_size']})")
+    emit(f"writing {out_cfg['path']} (compression={effective_compression}, "
+         f"pyramid={out_cfg['pyramid']}, tile={out_cfg['tile_size']}, "
+         f"page_height={page_height})")
     t0 = time.time()
-    merged.tiffsave(out_cfg["path"], **save_kwargs)
+    combined.tiffsave(out_cfg["path"], **save_kwargs)
     elapsed = time.time() - t0
-    emit(f"tiffsave complete in {elapsed:.1f} s")
+
+    # Verify the file actually got written (vips occasionally swallows errors)
+    import os
+    if not os.path.exists(out_cfg["path"]):
+        err(f"tiffsave returned success but {out_cfg['path']} doesn't exist")
+        return 5
+    size = os.path.getsize(out_cfg["path"])
+    if size < 1024:
+        err(f"tiffsave returned success but {out_cfg['path']} is only {size} bytes")
+        return 6
+    emit(f"tiffsave complete in {elapsed:.1f} s — output is {size / 1024 / 1024:.1f} MB")
 
     return 0
 
