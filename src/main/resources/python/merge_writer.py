@@ -33,6 +33,50 @@ def err(msg: str) -> None:
     print(f"MERGE-ERR: {msg}", file=sys.stderr, flush=True)
 
 
+def build_ome_xml(channel_names: list[str], width: int, height: int, pixel_type: str) -> str:
+    """Construct an OME-XML string declaring N channels at (width, height).
+
+    Vital for QuPath / Bio-Formats: without this, the N TIFF pages we write
+    are interpreted as N separate single-channel images instead of a single
+    N-channel image, and the user sees the file in QuPath as 11 series
+    instead of an 11-channel WSI.
+    """
+    from xml.sax.saxutils import escape
+
+    type_map = {"uchar": "uint8", "ushort": "uint16", "char": "int8", "short": "int16",
+                "uint": "uint32", "int": "int32", "float": "float", "double": "double"}
+    ome_type = type_map.get(pixel_type, "uint8")
+
+    n = len(channel_names)
+    channels_xml = "".join(
+        f'      <Channel ID="Channel:0:{i}" Name="{escape(name)}" SamplesPerPixel="1"/>\n'
+        for i, name in enumerate(channel_names)
+    )
+    tiffdata_xml = "".join(
+        f'      <TiffData FirstC="{i}" FirstZ="0" FirstT="0" IFD="{i}" PlaneCount="1"/>\n'
+        for i in range(n)
+    )
+
+    xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06"\n'
+        '     xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"\n'
+        '     xsi:schemaLocation="http://www.openmicroscopy.org/Schemas/OME/2016-06 '
+        'http://www.openmicroscopy.org/Schemas/OME/2016-06/ome.xsd">\n'
+        '  <Image ID="Image:0" Name="merged">\n'
+        f'    <Pixels ID="Pixels:0" DimensionOrder="XYCZT" Type="{ome_type}"\n'
+        f'            SizeX="{width}" SizeY="{height}"\n'
+        f'            SizeC="{n}" SizeZ="1" SizeT="1"\n'
+        '            Interleaved="false">\n'
+        f'{channels_xml}'
+        f'{tiffdata_xml}'
+        '    </Pixels>\n'
+        '  </Image>\n'
+        '</OME>\n'
+    )
+    return xml
+
+
 def _supports_compression(pyvips_mod, compression: str) -> bool:
     """Probe whether libvips' tiffsave supports a given compression by trying a 1x1 save.
        Some Windows builds of libvips (notably pyvips-binary) ship without JPEG2000 or WebP."""
@@ -164,6 +208,7 @@ def run(recipe: dict) -> int:
     # which we get by arrayjoin (vertical stack) + page_height. Each page
     # ends up as a single-band image, which JPEG can compress just fine.
     images = [img for _, img in all_channels]
+    channel_names = [ch["output_name"] for ch, _ in all_channels]
     if len(images) == 1:
         combined = images[0]
         page_height = out_h
@@ -173,6 +218,11 @@ def run(recipe: dict) -> int:
     emit(f"arrayjoin complete: total {combined.width}x{combined.height} "
          f"(= {len(images)} channels x page_height={page_height}), "
          f"per-page bands={images[0].bands} format={combined.format}")
+
+    # -------- Attach OME-XML so QuPath / Bio-Formats see N channels (not N images) --------
+    ome_xml = build_ome_xml(channel_names, out_w, out_h, combined.format)
+    combined.set_type(pyvips.GValue.gstr_type, "image-description", ome_xml)
+    emit(f"attached OME-XML ({len(ome_xml)} chars, {len(channel_names)} channels declared)")
 
     # -------- compression capability check + fallback --------
     requested_compression = out_cfg["compression"]
