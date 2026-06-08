@@ -36,3 +36,4 @@ hs_err*.log
 *thumbs.db
 bin/
 
+__pycache__/
