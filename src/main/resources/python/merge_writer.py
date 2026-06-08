@@ -209,18 +209,37 @@ def run(recipe: dict) -> int:
     # ends up as a single-band image, which JPEG can compress just fine.
     images = [img for _, img in all_channels]
     channel_names = [ch["output_name"] for ch, _ in all_channels]
-    if len(images) == 1:
+    num_channels = len(images)
+    # Per-channel geometry MUST be captured from the un-joined images — after
+    # arrayjoin the combined image is 1 band and num_channels x taller.
+    page_h = out_h
+    page_w = out_w
+    if num_channels == 1:
         combined = images[0]
-        page_height = out_h
     else:
-        combined = pyvips.Image.arrayjoin(images, across=1)
-        page_height = out_h
+        combined = pyvips.Image.arrayjoin(images, across=1)   # height = N * page_h
     emit(f"arrayjoin complete: total {combined.width}x{combined.height} "
-         f"(= {len(images)} channels x page_height={page_height}), "
+         f"(= {num_channels} channels x page_h={page_h}), "
          f"per-page bands={images[0].bands} format={combined.format}")
 
-    # -------- Attach OME-XML so QuPath / Bio-Formats see N channels (not N images) --------
-    ome_xml = build_ome_xml(channel_names, out_w, out_h, combined.format)
+    # -------- Take a PRIVATE COPY before mutating the header (mandatory) --------
+    # pyvips pipeline images are immutable; set_type on a shared header may not
+    # land on the image tiffsave actually writes. This was THE bug that made
+    # QuPath read the channels as time points and miss the pyramid.
+    combined = combined.copy()
+
+    # -------- page-height as a gint IMAGE FIELD (NOT a tiffsave kwarg) ----------
+    # Value = ONE channel's height so the tall strip splits into exactly N
+    # full-resolution pages. This is jcupitt's (libvips author) tested idiom and
+    # the only form that composes correctly with pyramid=True + subifd=True.
+    if num_channels > 1:
+        combined.set_type(pyvips.GValue.gint_type, "page-height", page_h)
+
+    # -------- Attach OME-XML so QuPath / Bio-Formats see N CHANNELS (not time) --
+    # SizeC/SizeX/SizeY come from the PRE-join per-channel geometry. TiffData IFD
+    # indices count only the N full-resolution pages; pyramid sub-levels live in
+    # SubIFDs (tag 330) off the main chain and are never referenced here.
+    ome_xml = build_ome_xml(channel_names, page_w, page_h, combined.format)
     combined.set_type(pyvips.GValue.gstr_type, "image-description", ome_xml)
     emit(f"attached OME-XML ({len(ome_xml)} chars, {len(channel_names)} channels declared)")
 
@@ -231,27 +250,29 @@ def run(recipe: dict) -> int:
     if fallback_note:
         emit(f"NOTE: {fallback_note}")
 
-    # -------- tiffsave --------
+    # -------- tiffsave (page-height is a header field now, NOT a kwarg) --------
     save_kwargs: dict = {
         "tile": True,
         "tile_width": out_cfg["tile_size"],
         "tile_height": out_cfg["tile_size"],
         "bigtiff": True,
         "compression": effective_compression,
-        # page_height splits the tall arrayjoin image into N pages
-        "page_height": page_height,
+        # depth: LEAVE UNSET. tiffsave defaults to ONETILE (pyramid down to one
+        # tile), which is correct for OME-TIFF.
     }
     if effective_compression in ("jpeg", "jp2k", "webp"):
         save_kwargs["Q"] = int(out_cfg.get("quality", 85))
     if out_cfg["pyramid"] != "single":
         save_kwargs["pyramid"] = True
-        # Put pyramid levels as SubIFDs of the main IFDs — cleaner for OME-TIFF
-        # readers (Bio-Formats / QuPath / ImageJ) than interleaving as more pages.
+        # subifd=True is THE flag that makes Bio-Formats/QuPath see a pyramid:
+        # reduced-res levels go into SubIFDs (tag 330) of each full-res page
+        # instead of becoming extra main-chain pages (which collide with the
+        # one-page-per-channel OME layout and trigger "Auto pyramidalize").
         save_kwargs["subifd"] = True
 
     emit(f"writing {out_cfg['path']} (compression={effective_compression}, "
          f"pyramid={out_cfg['pyramid']}, tile={out_cfg['tile_size']}, "
-         f"page_height={page_height})")
+         f"page_h={page_h})")
     t0 = time.time()
     combined.tiffsave(out_cfg["path"], **save_kwargs)
     elapsed = time.time() - t0
