@@ -110,30 +110,31 @@ def pick_fallback_compression(pyvips_mod, requested: str, vips_format: str):
                    f"{vips_format} (not 8-bit); using LZW (lossless, ~2-3x larger file)")
 
 
-def invert_affine(m: list[list[float]]) -> tuple[float, float, float, float, float, float]:
-    """Return (a, b, c, d, odx, ody) for vips affine such that
-       output(x, y) = input(a*x + b*y + odx, c*x + d*y + ody)
-       maps the moving image into the fixed grid.
+def vips_affine_params(m: list[list[float]]) -> tuple[float, float, float, float, float, float]:
+    """Return (a, b, c, d, odx, ody) for pyvips Image.affine().
 
-       Our input matrix M maps moving_full -> fixed_full,
-       i.e. M @ [x_m, y_m, 1]^T = [x_f, y_f, 1]^T.
-       vips affine wants the INVERSE direction: given an output
-       pixel (x_f, y_f), where do we sample from in input?
-       That's M_inv @ [x_f, y_f, 1]^T.
+    vips affine is a FORWARD map input->output:
+        X = a*x + b*y + odx,   Y = c*x + d*y + ody
+    where (x, y) is an INPUT pixel and (X, Y) the OUTPUT pixel. This was
+    verified against real libvips: a unit pixel at (2, 1) with odx=3, ody=4
+    lands at (5, 5).
+
+    Our matrix M maps moving_full -> fixed_full, i.e. M @ [x_m, y_m, 1] =
+    [x_f, y_f, 1] — exactly the forward (input=moving -> output=fixed) map
+    vips wants. So we pass M's coefficients DIRECTLY.
+
+    (A previous version returned inv(M) here under the wrong belief that vips
+    samples output->input. That misplaced the moving channels by ~2x the
+    offset in the wrong direction — real-vips NCC vs the fixed DAPI dropped
+    from 0.52 to 0.02, i.e. total misregistration in the merged file even
+    though the registration matrix itself was correct.)
     """
     a, b, tx = m[0]
     c, d, ty = m[1]
     det = a * d - b * c
     if abs(det) < 1e-12:
         raise ValueError(f"Affine matrix is singular (det={det})")
-    inv_det = 1.0 / det
-    ai = d * inv_det
-    bi = -b * inv_det
-    ci = -c * inv_det
-    di = a * inv_det
-    odx = (b * ty - d * tx) * inv_det
-    ody = (c * tx - a * ty) * inv_det
-    return ai, bi, ci, di, odx, ody
+    return a, b, c, d, tx, ty
 
 
 def run(recipe: dict) -> int:
@@ -179,14 +180,14 @@ def run(recipe: dict) -> int:
         mv_path = mv["path"]
         matrix = mv["matrix"]
         emit(f"loading moving {mv_idx + 1}/{len(movings_cfg)}: {mv_path}")
-        a, b, c, d, odx, ody = invert_affine(matrix)
-        emit(f"  affine inv: [{a:+.6e} {b:+.6e}; {c:+.6e} {d:+.6e}] + ({odx:+.2f}, {ody:+.2f})")
+        a, b, c, d, odx, ody = vips_affine_params(matrix)
+        emit(f"  affine fwd: [{a:+.6e} {b:+.6e}; {c:+.6e} {d:+.6e}] + ({odx:+.2f}, {ody:+.2f})")
         for ch in mv["channels"]:
             if not ch["include"]:
                 continue
             raw = pyvips.Image.tiffload(mv_path, page=ch["page"])
-            # vips.affine maps output_pixel -> input_pixel via [a,b,c,d,odx,ody]
-            # oarea defines the output canvas. We use the fixed image size.
+            # vips.affine is a FORWARD map input->output: place moving pixel
+            # (x,y) at fixed (a*x+b*y+odx, c*x+d*y+ody). oarea = fixed canvas.
             warped = raw.affine(
                 [a, b, c, d],
                 odx=odx,
